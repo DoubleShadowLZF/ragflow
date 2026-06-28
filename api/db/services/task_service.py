@@ -483,6 +483,7 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
     ck_num = 0
     if prev_tasks:
         for task in parse_task_array:
+            # 从已完成的历史任务中查找匹配的任务，并复用其产生的chunk（文本块），避免重复解析。
             ck_num += reuse_prev_task_chunks(task, prev_tasks, chunking_config)
         # 清理旧任务
         # 删除所有旧任务记录，但保留复用的chunk数据
