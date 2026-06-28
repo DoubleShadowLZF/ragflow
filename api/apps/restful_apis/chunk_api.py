@@ -160,8 +160,15 @@ def _enrich_chunks_with_document_metadata(chunks: list[dict], metadata_fields=No
 @login_required
 @add_tenant_id_to_kwargs
 async def parse(tenant_id, dataset_id):
+    """
+    批量解析指定数据集下的文档
+    """
+    # 权限验证 ： 检查当前用户是否有权限访问该数据集。
     if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    # 参数解析与去重
+    # 必须提供document_ids参数
+    # 对文档ID列表进行去重处理
     req = await get_request_json()
     if not req.get("document_ids"):
         return get_error_data_result("`document_ids` is required")
@@ -171,13 +178,18 @@ async def parse(tenant_id, dataset_id):
 
     not_found = []
     success_count = 0
+    # 文档处理循环
     for id in doc_list:
+        # 验证文档存在性和权限
         doc = DocumentService.query(id=id, kb_id=dataset_id)
         if not doc:
             not_found.append(id)
             continue
         if not doc:
             return get_error_data_result(message=f"You don't own the document {id}.")
+        # 状态检查
+        # 检查文档是否正在处理中（状态为RUNNING）
+        # 原子更新状态为"运行中"
         info = {"run": "1", "progress": 0, "progress_msg": "", "chunk_num": 0, "token_num": 0}
         if (
             DocumentService.filter_update(
@@ -190,6 +202,9 @@ async def parse(tenant_id, dataset_id):
             == 0
         ):
             return get_error_data_result("Can't parse document that is currently being processed")
+        # 清理旧数据
+        # 删除文档在向量数据库中的旧索引
+        # 删除相关的任务记录
         index_name = search.index_name(tenant_id)
         if settings.docStoreConn.index_exist(index_name, dataset_id):
             settings.docStoreConn.delete({"doc_id": id}, index_name, dataset_id)
@@ -205,8 +220,15 @@ async def parse(tenant_id, dataset_id):
         doc = doc.to_dict()
         doc["tenant_id"] = tenant_id
         bucket, name = File2DocumentService.get_storage_address(doc_id=doc["id"])
+        # 创建解析任务
+        # 将文档放入任务队列进行异步解析。
         queue_tasks(doc, bucket, name, 0)
         success_count += 1
+    # 错误处理与响应
+    # 文档未找到：返回未找到的文档ID列表
+    # 部分成功：返回成功数量和错误信息
+    # 完全失败：返回错误信息
+    # 全部成功：返回成功响应
     if not_found:
         return get_result(message=f"Documents not found: {not_found}", code=RetCode.DATA_ERROR)
     if duplicate_messages:

@@ -374,8 +374,26 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
         - For Excel documents, tasks are created per row range
         - Task digests are calculated for optimization and reuse
         - Previous task chunks may be reused if available
+
+    文档异步处理的任务队列创建函数，负责将文档解析任务切分并放入消息队列。
+
+    关键设计理念
+    1.细粒度任务拆分：大文档拆成小任务，避免单个任务耗时过长
+    2.智能复用：通过digest匹配避免重复工作，提升效率
+    3.资源隔离：不同文档类型使用不同队列
+    4.可观测性：任务信息存入数据库，便于监控进度
+    5.原子性：先更新数据库再推队列，确保一致性
+
+    任务复用流程图
+    新任务 → 计算digest → 查询旧任务
+    ↓
+    ├─ 匹配成功 → 复用chunk → 跳过处理
+    ↓
+    └─ 匹配失败 → 推入队列 → 等待worker处理
     """
 
+    # 任务状态管理
+    # 初始化任务信息
     def new_task():
         return {
             "id": get_uuid(),
@@ -388,12 +406,20 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
 
     parse_task_array = []
 
+    # 文档类型处理逻辑
+    # PDF文档处理
     if doc["type"] == FileType.PDF.value:
         file_bin = settings.STORAGE_IMPL.get(bucket, name)
         do_layout = doc["parser_config"].get("layout_recognize", "DeepDOC")
+        # 获取PDF总页数
         pages = PdfParser.total_page_number(doc["name"], file_bin)
         if pages is None:
             pages = 0
+        # 根据配置确定每批处理的页数（page_size）
+        # 特殊处理：
+        # 论文（paper）：每批22页
+        # 简历（resume）或知识图谱模式：一页一处理
+        # 默认：每批12页
         page_size = doc["parser_config"].get("task_page_size") or 12
         if doc["parser_id"] == "paper":
             page_size = doc["parser_config"].get("task_page_size") or 22
@@ -409,23 +435,33 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
                 task["from_page"] = p
                 task["to_page"] = min(p + page_size, e)
                 parse_task_array.append(task)
-
+    # Excel文档处理
     elif doc["parser_id"] == "table":
         file_bin = settings.STORAGE_IMPL.get(bucket, name)
+        # 获取Excel总行数
         rn = RAGFlowExcelParser.row_number(doc["name"], file_bin)
+        # 每3000行切分为一个任务
+        # 用from_page和to_page表示行范围（复用字段名）
         for i in range(0, rn, 3000):
             task = new_task()
             task["from_page"] = i
             task["to_page"] = min(i + 3000, rn)
             parse_task_array.append(task)
+    # 其他文档类型
+    # 直接创建一个完整任务（如Word、PPT等）
     else:
         parse_task_array.append(new_task())
 
     # Determine suffix based on parser_id (consistent with SAAS version line 444)
     suffix = "common" if doc["parser_id"] != "resume" else "resume"
 
+    # 任务去重优化（关键）
     chunking_config = DocumentService.get_chunking_config(doc["id"])
     for task in parse_task_array:
+        # 计算任务摘要（digest）
+        # 摘要包含：
+        # 分块配置（chunking_config）
+        # 文档ID、页面/行范围
         hasher = xxhash.xxh64()
         for field in sorted(chunking_config.keys()):
             if field == "parser_config":
@@ -440,12 +476,19 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
         task["progress"] = 0.0
         task["priority"] = priority
 
+    # 复用之前任务的结果
+    # 通过digest匹配，如果配置和范围相同，直接复用之前的chunk结果
+    # 避免重复计算，节省资源
     prev_tasks = TaskService.get_tasks(doc["id"])
     ck_num = 0
     if prev_tasks:
         for task in parse_task_array:
             ck_num += reuse_prev_task_chunks(task, prev_tasks, chunking_config)
+        # 清理旧任务
+        # 删除所有旧任务记录，但保留复用的chunk数据
         TaskService.filter_delete([Task.doc_id == doc["id"]])
+        # 清理孤儿chunk
+        # 删除没有被复用的旧chunk，释放向量数据库空间
         pre_chunk_ids = []
         for pre_task in prev_tasks:
             if pre_task["chunk_ids"]:
@@ -455,12 +498,21 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
                                          chunking_config["kb_id"])
     DocumentService.update_by_id(doc["id"], {"chunk_num": ck_num})
 
+    # 批量插入任务 : 将任务列表批量插入数据库，便于监控和查询
     bulk_insert_into_db(Task, parse_task_array, True)
+    # 更新文档状态 : 标记文档开始解析，状态变为PARSING
     DocumentService.begin2parse(doc["id"])
 
+    # 任务队列管理
     unfinished_task_array = [task for task in parse_task_array if task["progress"] < 1.0]
     for unfinished_task in unfinished_task_array:
+        # 队列推送
+        # 使用Redis作为消息队列，unfinished_task是任务消息体
         assert REDIS_CONN.queue_product(
+            # 根据优先级和类型选择队列
+            # suffix：common或resume
+            # 不同类型文档使用不同队列，便于资源隔离
+            # priority：优先级参数，高优先级任务先处理
             settings.get_svr_queue_name(priority, suffix), message=unfinished_task
         ), "Can't access Redis. Please check the Redis' status."
 
@@ -485,8 +537,29 @@ def reuse_prev_task_chunks(task: dict, prev_tasks: list[dict], chunking_config: 
         - A previous task exists with matching page range and configuration digest
         - The previous task was completed successfully (progress = 1.0)
         - The previous task has valid chunk IDs
+
+    从已完成的历史任务中查找匹配的任务，并复用其产生的chunk（文本块），避免重复解析。
+    场景1：完全相同配置重新解析
+    text
+    第一次解析：文档A，使用分块大小512，已生成chunk_ids: [c1, c2, c3]
+    第二次解析：文档A，使用分块大小512 → 匹配成功 → 复用 [c1, c2, c3]
+    结果：无需实际解析，直接使用已有结果。
+
+    场景2：部分页面重新解析
+    text
+    第一次解析：文档A (1-100页)，任务1: 1-50页，任务2: 51-100页
+    第二次解析：文档A (1-100页)，只修改了50-60页内容
+    任务1 (1-50页)：匹配成功 → 复用
+    任务2 (51-100页)：匹配失败 → 需要重新解析
+    结果：只重新解析必要的部分，节省50%计算资源。
     """
     idx = 0
+    # 查找匹配的旧任务
+    # 页面范围相同（from_page和to_page）
+    # 配置摘要相同（digest）：
+    # 1.相同的分块配置
+    # 2.相同的文档ID
+    # 3.相同的解析参数
     while idx < len(prev_tasks):
         prev_task = prev_tasks[idx]
         if prev_task.get("from_page", 0) == task.get("from_page", 0) \
@@ -494,21 +567,35 @@ def reuse_prev_task_chunks(task: dict, prev_tasks: list[dict], chunking_config: 
             break
         idx += 1
 
+    # 验证复用条件
+    # 只有满足以下条件才能复用：
+    # 1.旧任务已完成（progress = 1.0）
+    # 2.旧任务有有效的chunk IDs
     if idx >= len(prev_tasks):
         return 0
     prev_task = prev_tasks[idx]
     if prev_task["progress"] < 1.0 or not prev_task["chunk_ids"]:
         return 0
+    # 复用数据 ： 直接从旧任务复制结果，无需重新处理。
     task["chunk_ids"] = prev_task["chunk_ids"]
     task["progress"] = 1.0
-    if "from_page" in task and "to_page" in task and (int(task['to_page']) - int(task['from_page']) >= 10 ** 6 or (int(task['from_page']) == MAXIMUM_TASK_PAGE_NUMBER and int(task['to_page']) == MAXIMUM_TASK_PAGE_NUMBER)):
+    # 生成进度信息
+    # 进度信息格式：时间戳 页面范围 Reused previous task's chunks.
+    if "from_page" in task and "to_page" in task and (int(task['to_page']) - int(task['from_page']) >= 10 ** 6 or (
+            int(task['from_page']) == MAXIMUM_TASK_PAGE_NUMBER and int(task['to_page']) == MAXIMUM_TASK_PAGE_NUMBER)):
         task["progress_msg"] = f"Page({task['from_page']}~{task['to_page']}): "
     else:
         task["progress_msg"] = ""
     task["progress_msg"] = " ".join(
         [datetime.now().strftime("%H:%M:%S"), task["progress_msg"], "Reused previous task's chunks."])
+    # 清理已复用的任务 ： 清空旧任务的chunk_ids，防止被其他任务再次复用（一次性复用）。
+    # 这是一个防重复复用机制：
+    # 每个旧任务的chunk只能被复用一次
+    # 避免多个新任务引用同一个旧任务的chunk
+    # 防止后续批量删除时误删仍在使用的chunk
     prev_task["chunk_ids"] = ""
 
+    # 返回复用的chunk数量 ： 返回复用的chunk数量，用于统计文档的总chunk数。
     return len(task["chunk_ids"].split())
 
 
