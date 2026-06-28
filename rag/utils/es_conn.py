@@ -84,6 +84,10 @@ class ESConnection(ESConnectionBase):
         remaining_take = max(0, limit)
         with_aggs = True
 
+        # 每次从上一批次的最后一条文档获取 sort 值作为新的游标
+        # 累进减少 remaining_skip
+        # 第一次请求保存 template_res（包含 total 信息）
+        # 后续请求禁用聚合（with_aggs=False）以提升性能
         while remaining_skip > 0:
             batch = min(SEARCH_AFTER_BATCH_SIZE, remaining_skip)
             q_iter = copy.deepcopy(q_base)

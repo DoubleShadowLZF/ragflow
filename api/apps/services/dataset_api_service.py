@@ -1285,6 +1285,16 @@ async def search_datasets(tenant_id: str, req: dict):
     :param tenant_id: tenant ID
     :param req: search request containing dataset_ids and other params
     :return: (success, result) or (success, error_message)
+    关键设计特点
+    特性	            说明
+    混合检索	        向量相似度 + 全文检索（通过keyword参数控制）
+    多租户支持	    跨租户访问检查，确保数据隔离
+    灵活的配置方式	    支持预设配置或动态参数
+    智能过滤	        自动/半自动元数据过滤
+    检索增强	        多语言翻译、关键词提取
+    重排序	        可选的重排序模型优化结果
+    知识图谱集成	    可选的知识图谱检索增强
+    父子文档处理	    处理块级文档与父文档的关系
     """
     from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, split_model_name
     from api.db.services.doc_metadata_service import DocMetadataService
@@ -1296,6 +1306,7 @@ async def search_datasets(tenant_id: str, req: dict):
     from rag.app.tag import label_question
     from rag.prompts.generator import cross_languages, keyword_extraction
 
+    # 参数提取与初始化
     kb_ids = req.get("dataset_ids", [])
     page = int(req.get("page", 1))
     size = int(req.get("size", 30))
@@ -1333,10 +1344,12 @@ async def search_datasets(tenant_id: str, req: dict):
         return False, "`doc_ids` should be a list"
     local_doc_ids = list(doc_ids) if doc_ids else []
 
+    # 配置加载（支持两种模式）
     meta_data_filter = {}
     search_id = req.get("search_id", "")
     search_config = {}
     chat_mdl = None
+    # 模式A：使用预存配置
     if search_id:
         search_detail = SearchService.get_detail(search_id)
         if not search_detail:
@@ -1366,14 +1379,18 @@ async def search_datasets(tenant_id: str, req: dict):
             else:
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
+    # 模式B：使用请求参数
     else:
         meta_data_filter = req.get("meta_data_filter") or {}
+        # 元数据过滤（智能过滤）
         if meta_data_filter.get("method") in ["auto", "semi_auto"]:
             chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
 
     if meta_data_filter:
         logging.debug(f"Metadata filter: {meta_data_filter}, question: {question}, chat_mdl={'None' if chat_mdl is None else chat_mdl.llm_name}")
+        # 元数据过滤，用于根据元数据过滤规则筛选文档ID。它支持三种模式（自动/半自动/手动），并且优先使用数据库推送过滤（Push-down）以提升性能
+        # 例如：用户问"2024年的销售报告"，自动过滤出metadata中year=2024的文档。
         local_doc_ids = await apply_meta_data_filter(
             meta_data_filter,
             None,
@@ -1395,6 +1412,7 @@ async def search_datasets(tenant_id: str, req: dict):
 
     kb = kbs[0]
     _question = question
+    # 查询增强处理：多语言处理：将查询翻译成多种语言，提升跨语言检索效果。
     if langs:
         _question = await cross_languages(kb.tenant_id, None, _question, langs)
     if kb.embd_id:
@@ -1409,12 +1427,15 @@ async def search_datasets(tenant_id: str, req: dict):
         rerank_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.RERANK.value, rerank_id)
         rerank_mdl = LLMBundle(kb.tenant_id, rerank_model_config)
 
+    # 关键词提取（如果启用）：使用LLM从问题中提取关键词，追加到查询中提升召回率。
     if search_config.get("keyword", req.get("keyword", False)):
         default_chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
         chat_mdl = LLMBundle(kb.tenant_id, default_chat_model_config)
         _question += await keyword_extraction(chat_mdl, _question)
 
+    # 标签生成：为查询生成标签，用于后续的排序和检索优化。
     labels = label_question(_question, kbs)
+    # 核心检索执行
     ranks = await settings.retriever.retrieval(
         _question,
         embd_mdl,
@@ -1431,6 +1452,7 @@ async def search_datasets(tenant_id: str, req: dict):
         trace_id=search_id,
     )
 
+    # 知识图谱检索（可选）
     if use_kg:
         try:
             default_chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
@@ -1439,6 +1461,7 @@ async def search_datasets(tenant_id: str, req: dict):
                 ranks["chunks"].insert(0, ck)
         except Exception:
             logging.warning("search_datasets KG retrieval failed: datasets=%s tenant=%s", kb_ids, tenant_id, exc_info=True)
+    # 后处理与返回
     ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
     ranks["total"] = len(ranks["chunks"])
 

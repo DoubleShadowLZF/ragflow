@@ -222,6 +222,9 @@ async def apply_meta_data_filter(
     cached_metas: dict | None = metas
 
     def _get_metas() -> dict:
+        """
+        使用闭包实现懒加载：只有在真正需要元数据时才加载（通过metas_loader），避免不必要的数据库查询。
+        """
         nonlocal cached_metas
         if cached_metas is None:
             cached_metas = metas_loader() if metas_loader else {}
@@ -232,6 +235,7 @@ async def apply_meta_data_filter(
         if conditions and kb_ids:
             try:
                 from api.db.services.doc_metadata_service import DocMetadataService
+                # 推送过滤：将过滤条件下推到数据库（ES/Infinity）执行，性能更好
                 doc_ids = DocMetadataService.filter_doc_ids_by_meta_pushdown(kb_ids, conditions, logic)
                 logging.debug(f"Doc ids filtered by metadata: {doc_ids}")
                 if doc_ids is not None:
@@ -241,14 +245,18 @@ async def apply_meta_data_filter(
 
         # In-memory fallback
         logging.debug("Metadata filter falls back to in-memory filter")
+        # 内存过滤：如果推送失败或没有kb_ids，在Python内存中执行过滤
         return meta_filter(_get_metas(), conditions, logic)
 
+    # 自动模式 (auto)
     if method == "auto":
+        # 使用LLM分析用户问题（question）
         filters: dict = await gen_meta_filter(chat_mdl, _get_metas(), question)
         logging.debug(f"Metadata filter(auto) generated: {filters}")
         doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
         if not doc_ids:
             return None
+    # 半自动模式 (semi_auto)
     elif method == "semi_auto":
         selected_keys = []
         constraints = {}
@@ -271,6 +279,7 @@ async def apply_meta_data_filter(
                 doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
                 if not doc_ids:
                     return None
+    # 手动模式 (manual)
     elif method == "manual":
         filters = meta_data_filter.get("manual", [])
         if manual_value_resolver:

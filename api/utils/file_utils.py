@@ -163,6 +163,8 @@ def repair_pdf_with_ghostscript(input_bytes):
     if shutil.which("gs") is None:
         return input_bytes
 
+    # 使用 gs（Ghostscript）修复PDF文件，本质上就是利用它的 pdfwrite 设备将原始PDF文件重新解析并生成一份新的PDF文件。这个过程会尝试纠正原文件中的很多结构性问题。
+    # 并非商用免费，可以使用商用免费的pikepdf 修复pdf文件
     with tempfile.NamedTemporaryFile(suffix=".pdf") as temp_in, tempfile.NamedTemporaryFile(suffix=".pdf") as temp_out:
         temp_in.write(input_bytes)
         temp_in.flush()

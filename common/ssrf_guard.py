@@ -129,7 +129,14 @@ def assert_url_is_safe(
     Returns ``(hostname, resolved_ip)`` — the first validated public IP string
     — so the caller can **pin** that address in its HTTP client and prevent
     DNS-rebinding attacks (the hostname is resolved exactly once).
+
+    SSRF（服务器端请求伪造）防护的关键实现。它的核心目的是：在服务器向外发起HTTP请求前，对目标URL进行严格的安全检查，防止攻击者利用服务器去访问内网资源或进行端口扫描。
+
     """
+    # 协议（Scheme）白名单检查
+    #
+    # 目的：只允许特定的协议，如 http 和 https，防止使用 file://、gopher:// 等危险协议。
+    # 实现：检查URL的scheme是否在预定义的 _DEFAULT_ALLOWED_SCHEMES 集合中。如果不在，直接抛出异常。
     parsed = urlparse(url)
     scheme = parsed.scheme
     if scheme not in allowed_schemes:
@@ -140,6 +147,10 @@ def assert_url_is_safe(
         )
         raise ValueError(f"Disallowed URL scheme: {scheme!r}. Only {sorted(allowed_schemes)} are allowed.")
 
+    # 主机名（Hostname）存在性检查
+    #
+    # 目的：确保URL包含有效的主机名，防止解析异常。
+    # 实现：解析URL，如果 hostname 为空，则拒绝请求。
     hostname = parsed.hostname
     if not hostname:
         logger.warning("SSRF guard blocked URL with missing host: url=%r", url)
@@ -151,6 +162,19 @@ def assert_url_is_safe(
         logger.warning("SSRF guard could not resolve hostname=%r reason=%s", hostname, exc)
         raise ValueError(f"Could not resolve hostname {hostname!r}: {exc}") from exc
 
+    # IP地址合法性检查（核心防护）
+    #
+    # 目的：这是最核心的防线，确保解析出的IP地址是公网可路由的，从而阻止对内网IP、本地回环地址（127.0.0.1）、链路本地地址等的访问。
+    # 实现：
+    # 调用 socket.getaddrinfo 解析主机名，获取所有可能的IP地址。
+    # 对每个解析出的IP，使用 _effective_ip 函数进行处理（该函数主要用于将IPv4映射的IPv6地址，如 ::ffff:192.168.1.1，归一化为IPv4格式，以便进行统一的检查）。
+    # 使用 ip_address.is_global 方法进行检查。这是一个白名单方法，它只会放行全局公网IP，而拦截所有私有、保留、多播等非公网地址。
+    #
+    #
+    # 防止DNS重绑定攻击
+    #
+    # 目的：解决攻击者将域名在“解析为公网IP”和“解析为内网IP”之间来回切换的问题。
+    # 实现：函数在通过所有检查后，会返回一个确切的IP地址字符串（返回值的第二个元素 resolved_ip）。代码的文档注释中明确说明，调用者应使用这个IP地址去创建HTTP连接，而不是使用原始的域名，这样就确保了连接IP是经过安全检查的唯一地址。
     resolved_ip: str | None = None
     for _family, _type, _proto, _canonname, sockaddr in addr_infos:
         raw_ip = ipaddress.ip_address(sockaddr[0])

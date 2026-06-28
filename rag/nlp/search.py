@@ -588,6 +588,17 @@ class Dealer:
             rank_feature: dict | None = {PAGERANK_FLD: 10},
             trace_id=None,
     ):
+        """
+        用户问题 + 过滤条件
+        ↓
+        第一阶段：多路召回（向量 + 全文 + 排序特征）
+        ↓
+        第二阶段：重排序（Rerank）或分数融合
+        ↓
+        第三阶段：阈值过滤 + 分页切片
+        ↓
+        第四阶段：组装返回结果 + 文档聚合统计
+        """
         ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
         if not question:
             return ranks
@@ -616,11 +627,18 @@ class Dealer:
         if isinstance(tenant_ids, str):
             tenant_ids = tenant_ids.split(",")
 
+        # 执行多路召回
+        # self.search：底层搜索引擎的调用，会执行：
+        #
+        # 向量检索：用 embd_mdl 对 question 编码，做 ANN 搜索
+        # 全文检索：基于倒排索引的关键词匹配
+        # 排序特征：如 rank_feature（PageRank 权重）
         idx_names = [index_name(tid) for tid in tenant_ids]
         sres = await self.search(req, idx_names, kb_ids, embd_mdl, highlight,
                            rank_feature=rank_feature)
         # Temporary retrieval-side guard: prune chunks whose parent document no
         # longer exists before reranking and returning results.
+        # 清理已被删除的文档块（防御性检查）
         sres = await self._prune_deleted_chunks(sres)
         if sres.total == 0:
             ranks["doc_aggs"] = []
@@ -851,12 +869,23 @@ class Dealer:
             idx_nms = index_name(tenant_ids)
         else:
             idx_nms = [index_name(tid) for tid in tenant_ids]
+        # min_match=0.0：极低匹配要求，尽可能多地召回
         match_txt, _ = self.qryr.question(question, min_match=0.0)
+        # ["tag_kwd"]：按标签字段聚合统计
         res = self.dataStore.search([], [], {}, [match_txt], OrderByExpr(), 0, 0, idx_nms, kb_ids, ["tag_kwd"])
+        # aggs = {
+        #     "python": 150,      # 标签 python 出现150次
+        #     "性能": 120,        # 标签 性能 出现120次
+        #     "优化": 80,         # 标签 优化 出现80次
+        #     "代码": 60,         # 标签 代码 出现60次
+        #     "debug": 10         # 标签 debug 出现10次
+        # }
         aggs = self.dataStore.get_aggregation(res, "tag_kwd")
         if not aggs:
             return {}
         cnt = np.sum([c for _, c in aggs])
+        # TF-IDF 变体算法 : Score = 0.1 × (c + 1) / (cnt + S) / max(1e-6, all_tags.get(a, 0.0001))
+        # S = 1000  # 平滑因子,避免小样本统计波动,防止未出现的标签导致除零错误
         tag_fea = sorted([(a, round(0.1 * (c + 1) / (cnt + S) / max(1e-6, all_tags.get(a, 0.0001)))) for a, c in aggs],
                          key=lambda x: x[1] * -1)[:topn_tags]
         return {a.replace(".", "_"): max(1, c) for a, c in tag_fea}

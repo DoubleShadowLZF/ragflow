@@ -330,6 +330,7 @@ class OSConnection(DocStoreConnection):
     ):
         """
         Refers to https://github.com/opensearch-project/opensearch-py/blob/main/guides/dsl.md
+        在 OpenSearch 中执行混合检索（全文+向量），支持过滤、排序、高亮和聚合。
         """
         use_knn = False
         use_text = False
@@ -338,6 +339,7 @@ class OSConnection(DocStoreConnection):
         assert isinstance(index_names, list) and len(index_names) > 0
         assert "_id" not in condition
 
+        # 构建 Bool Query（过滤条件）
         bqry = Q("bool", must=[])
         condition["kb_id"] = knowledgebase_ids
         for k, v in condition.items():
@@ -350,14 +352,17 @@ class OSConnection(DocStoreConnection):
                 continue
             if not v:
                 continue
+            # 多值匹配（terms）
             if isinstance(v, list):
                 bqry.filter.append(Q("terms", **{k: v}))
+            # 精确匹配（term）
             elif isinstance(v, str) or isinstance(v, int):
                 bqry.filter.append(Q("term", **{k: v}))
             else:
                 raise Exception(
                     f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
 
+        # 解析混合检索权重
         s = Search()
         vector_similarity_weight = 0.5
         for m in match_expressions:
@@ -367,8 +372,10 @@ class OSConnection(DocStoreConnection):
                     match_expressions[2], FusionExpr)
                 weights = m.fusion_params["weights"]
                 vector_similarity_weight = float(weights.split(",")[1])
+        # 处理匹配表达式
         knn_query = {}
         for m in match_expressions:
+            # 全文检索（MatchTextExpr）
             if isinstance(m, MatchTextExpr):
                 use_text = True
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
@@ -384,6 +391,7 @@ class OSConnection(DocStoreConnection):
             # while the Python SDK for OpenSearch does not provide encapsulation for KNN_search,
             # the following codes implement KNN_search in OpenSearch using DSL
             # Besides, Opensearch's DSL for KNN_search query syntax differs from that in Elasticsearch, I also made some adaptions for it
+            # 向量检索（MatchDenseExpr）
             elif isinstance(m, MatchDenseExpr):
                 assert (bqry is not None)
                 similarity = 0.0
@@ -398,22 +406,31 @@ class OSConnection(DocStoreConnection):
                 # available_int, ...). The text query is deliberately kept out of it:
                 # it's scored as its own leg in the hybrid query below, not used to
                 # pre-filter knn candidates.
+                # 只保留结构过滤条件，不包含文本查询
                 bool_inner = bqry.to_dict().get("bool", {})
                 if bool_inner.get("filter"):
                     knn_query[vector_column_name]["filter"] = {"bool": {"filter": bool_inner["filter"]}}
                 knn_query[vector_column_name]["boost"] = similarity
 
+        # Rank Feature（排序特征）
         if bqry and rank_feature:
             for fld, sc in rank_feature.items():
                 if fld != PAGERANK_FLD:
                     fld = f"{TAG_FLD}.{fld}"
                 bqry.should.append(Q("rank_feature", field=fld, linear={}, boost=sc))
 
+        # 构建 OpenSearch 查询
+        # force_source=True：强制从 _source 获取数据
+        # no_match_size=30：无匹配时返回30个字符
+        # require_field_match=False：字段不完全匹配时也高亮
         if bqry:
             s = s.query(bqry)
         for field in highlight_fields:
             s = s.highlight(field, force_source=True, no_match_size=30, require_field_match=False)
 
+        # 排序处理
+        # 数字字段使用 float 类型
+        # 文本字段使用 text 类型
         if order_by:
             orders = list()
             for field, order in order_by.fields:
@@ -428,6 +445,7 @@ class OSConnection(DocStoreConnection):
                 orders.append({field: order_info})
             s = s.sort(*orders)
 
+        # 聚合处理
         for fld in agg_fields:
             s.aggs.bucket(f'aggs_{fld}', 'terms', field=fld, size=1000000)
 
@@ -436,16 +454,23 @@ class OSConnection(DocStoreConnection):
         q = s.to_dict()
         logger.debug(f"OSConnection.search {str(index_names)} query: " + json.dumps(q))
 
+        # 混合查询构建（OpenSearch 特性）
+        # 模式	    查询结构	                                            说明
+        # 混合检索	{"hybrid": {"queries": [text_query, knn_query]}}	分别打分后合并
+        # 纯向量	    {"knn": knn_query}	                                只执行向量检索
+        # 纯文本	    标准 query_string	                                只执行全文检索
         hybrid_search = use_knn and use_text and getattr(self, "hybrid_search_enabled", False)
         if use_knn:
             if hybrid_search:
                 # both legs + a pipeline available: send a real hybrid query so the
                 # keyword (BM25) and vector (knn) legs are scored separately and
                 # merged by the pipeline.
+                # 混合检索：全文 + 向量分别打分，由 pipeline 合并
                 keyword_query = q.get("query")
                 q["query"] = {"hybrid": {"queries": [keyword_query, {"knn": knn_query}]}}
             else:
                 # vector-only, or no pipeline available: fall back to a plain knn query.
+                # 纯向量检索
                 del q["query"]
                 q["query"] = {"knn": knn_query}
 
@@ -453,6 +478,7 @@ class OSConnection(DocStoreConnection):
         if hybrid_search:
             search_kwargs["params"] = {"search_pipeline": self._hybrid_pipeline}
 
+        # 执行查询与重试
         for i in range(ATTEMPT_TIME):
             try:
                 res = self.os.search(index=index_names,

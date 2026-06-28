@@ -387,6 +387,17 @@ class InfinityConnection(InfinityConnectionBase):
                 embedding_clmns.append((n, int(r.group(1))))
 
             docs = copy.deepcopy(documents)
+            # 字段映射规则
+            # 原字段   	                目标字段	            转换方式
+            # docnm_kwd	                docnm	            直接映射
+            # title_kwd / title_sm_tks	docnm	            列表转字符串
+            # important_kwd	            important_keywords	列表转逗号分隔字符串
+            # content_with_weight	    content	            直接映射
+            # authors_tks	            authors	            直接映射
+            # question_kwd	            questions	        列表换行分隔
+            # meta_fields	            meta_fields	        字典转JSON字符串
+            # position_int	            position_int	    列表转十六进制字符串
+            # chunk_data	            chunk_data	        字典转JSON字符串
             for d in docs:
                 assert "_id" not in d
                 assert "id" in d

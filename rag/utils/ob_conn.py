@@ -550,6 +550,9 @@ class OBConnection(OBConnectionBase):
         rank_feature: dict | None = None,
         **kwargs,
     ):
+        """
+        在 OceanBase 数据库中执行多种类型的搜索，包括融合检索、向量检索、全文检索和聚合查询
+        """
         if isinstance(index_names, str):
             index_names = index_names.split(",")
         if not (isinstance(index_names, list) and len(index_names) > 0):
@@ -559,6 +562,7 @@ class OBConnection(OBConnectionBase):
         if len(match_expressions) == 3:
             if not self.enable_fulltext_search:
                 # disable fulltext search in fusion search, which means fallback to vector search
+                # 禁用全文检索，降级为纯向量检索
                 match_expressions = [m for m in match_expressions if isinstance(m, MatchDenseExpr)]
             else:
                 for m in match_expressions:
@@ -566,6 +570,10 @@ class OBConnection(OBConnectionBase):
                         weights = m.fusion_params["weights"]
                         vector_similarity_weight = get_float(weights.split(",")[1])
                         # skip the search if its weight is zero
+                        # 条件	                结果	        说明
+                        # vector_weight <= 0	纯全文检索	向量权重为0
+                        # vector_weight >= 1	纯向量检索	全文权重为0
+                        # 0 < vector_weight < 1	混合检索	    两者都保留
                         if vector_similarity_weight <= 0.0:
                             match_expressions = [m for m in match_expressions if isinstance(m, MatchTextExpr)]
                         elif vector_similarity_weight >= 1.0:
@@ -577,7 +585,9 @@ class OBConnection(OBConnectionBase):
         )
 
         # copied from es_conn.py
+        # ES 降级方案
         if len(match_expressions) == 3 and self.es:
+            # 当 OceanBase 的混合检索不可用时，降级使用 Elasticsearch 执行混合检索
             bqry = Q("bool", must=[])
             condition["kb_id"] = knowledgebase_ids
             for k, v in condition.items():
@@ -683,6 +693,8 @@ class OBConnection(OBConnectionBase):
                     result.total = result.total + 1
             return result
 
+        # 构建 SQL 查询表达式
+        # 字段选择
         output_fields = select_fields.copy()
         if "*" in output_fields:
             if index_names[0].startswith("ragflow_doc_meta_"):
@@ -702,6 +714,7 @@ class OBConnection(OBConnectionBase):
 
         fields_expr = ", ".join(output_fields)
 
+        # 过滤条件
         condition["kb_id"] = knowledgebase_ids
         filters: list[str] = get_filters(condition)
         filters_expr = " AND ".join(filters)
@@ -724,6 +737,7 @@ class OBConnection(OBConnectionBase):
         vector_search_filter: Optional[str] = None
 
         for m in match_expressions:
+            # 全文检索表达式
             if isinstance(m, MatchTextExpr):
                 if "original_query" not in m.extra_options:
                     raise ValueError("'original_query' is missing in extra_options.")
@@ -736,7 +750,7 @@ class OBConnection(OBConnectionBase):
                 )
                 for column_name in fulltext_search_expr.keys():
                     fulltext_search_idx_list.append(fulltext_index_name_template % column_name)
-
+            # 向量检索表达式
             elif isinstance(m, MatchDenseExpr):
                 if m.embedding_data_type != "float":
                     raise ValueError(f"embedding data type '{m.embedding_data_type}' is not float.")
@@ -792,10 +806,22 @@ class OBConnection(OBConnectionBase):
 
             fulltext_search_hint = f"/*+ UNION_MERGE({index_name} {' '.join(fulltext_search_idx_list)}) */" if self.use_fulltext_hint else ""
 
+            # 检索类型	    SQL 策略	                说明
+            # Fusion	    CTE + FULL OUTER JOIN	全文和向量分别检索后合并
+            # Vector	    APPROXIMATE LIMIT	    使用 ANN 索引加速
+            # Fulltext	    全文索引 + 排序	        使用 OceanBase 全文索引
+            # Aggregation	GROUP BY	            按字段分组统计
+            # Filter	    WHERE + ORDER BY	    纯过滤和排序
             if search_type == "fusion":
                 # fusion search, usually for chat
                 num_candidates = vector_topn + fulltext_topn
+                # 使用 CTE (Common Table Expression) 构建混合检索
+                # 两种融合策略对比：
+                # 策略	            特点	            适用场景
+                # 先全文后向量	    先召回候选再过滤	全文候选集较小
+                # FULL OUTER JOIN	分别检索再合并	    需要完整覆盖
                 if self.use_fulltext_first_fusion_search:
+                    # 先全文检索，再用向量过滤
                     count_sql = (
                         f"WITH fulltext_results AS ("
                         f"  SELECT {fulltext_search_hint} *, {fulltext_search_score_expr} AS relevance"
@@ -807,6 +833,7 @@ class OBConnection(OBConnectionBase):
                         f"  SELECT COUNT(*) FROM fulltext_results WHERE {vector_search_filter}"
                     )
                 else:
+                    # 分别检索全文和向量，再 FULL OUTER JOIN
                     count_sql = (
                         f"WITH fulltext_results AS ("
                         f"  SELECT {fulltext_search_hint} id FROM {index_name}"

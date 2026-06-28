@@ -40,7 +40,11 @@ class FulltextQueryer(QueryBase):
         ]
 
     def question(self, txt, tbl="qa", min_match: float = 0.6):
+        """
+        将用户查询转换为全文检索的查询表达式，支持分词、权重分配、同义词扩展和短语匹配，提升检索的召回率和精确度。
+        """
         original_query = txt
+        # 中英文之间加空格
         txt = self.add_space_between_eng_zh(txt)
 
         # Strip Infinity ESCAPABLE characters from the query.
@@ -48,6 +52,11 @@ class FulltextQueryer(QueryBase):
         # Infinity's search_lexer.l defines ESCAPABLE characters [\x20()^"'~*?:\\]
         # If these characters appear unescaped in a query, Infinity's lexer will
         # interpret them as special tokens, causing parsing errors.
+        # 操作       说明             示例
+        # 繁转简     tradi2simp      "繁體" → "繁体"
+        # 全角转半角  strQ2B           "，。" → ",."
+        # 转小写     lower()         "Hello" → "hello"
+        # 特殊字符替换  转为空格        "()^'~" → " "
         txt = re.sub(
             r"[ :|\r\n\t,，。？?/`!！&^%%()\[\]{}<>*~'\"\\]+",
             " ",
@@ -60,7 +69,9 @@ class FulltextQueryer(QueryBase):
             txt = self.rmWWW(txt)
             tks = rag_tokenizer.tokenize(txt).split()
             keywords = [t for t in tks if t]
+            # 使用TF-IDF计算词权重
             tks_w = self.tw.weights(tks, preprocess=False)
+            # 过滤空词
             tks_w = [(re.sub(r"[ \\\"'^]", "", tk), w) for tk, w in tks_w]
             tks_w = [(re.sub(r"^[\+-]", "", tk), w) for tk, w in tks_w if tk]
             tks_w = [(tk.strip(), w) for tk, w in tks_w if tk.strip()]
@@ -70,11 +81,25 @@ class FulltextQueryer(QueryBase):
                 # (e.g. WordNet returns "cat-o'-nine-tails" for "cat")
                 syn = [rag_tokenizer.tokenize(s).replace("'", "") for s in self.syn.lookup(tk)]
                 keywords.extend(syn)
+                # 同义词权重为1/4
                 syn = ["\"{}\"^{:.4f}".format(s, w / 4.) for s in syn if s.strip()]
                 syns.append(" ".join(syn))
-
+            # 单词语义权重
             q = ["({}^{:.4f}".format(tk, w) + " {})".format(syn) for (tk, w), syn in zip(tks_w, syns) if
                  tk and not re.match(r"[.^+\(\)-]", tk)]
+            # 短语匹配（相邻词）
+            # 1. 解决“词序”与“语义”问题,场景：区分“深度学习”和“学习深度”
+            # 2. 提升检索的“精确率（Precision）”,
+            # 场景：机器学习模型部署；
+            # 无短语匹配：系统可能返回三篇文档：一篇讲“机器学习”，一篇讲“模型部署”，还有一篇只提了“部署”一词。
+            # 有短语匹配：系统会优先返回包含完整短语“机器学习模型部署”或高度连续匹配的文档。
+            # 3. 增强“混合检索（Hybrid Search）”效果；场景：在许多现代RAG系统中，检索是混合的（向量语义检索 + 关键词检索）。
+            # 3.1.向量检索：擅长捕捉“语义相似”，比如“如何让代码跑得更快”能匹配到“代码性能优化技巧”。但它有时会忽略精确匹配。
+            # 3.2.关键词短语匹配：擅长捕捉“字面精确”。在检索代码、报错信息、专业术语（如“NullPointerException”、“Transformer架构”）时，一个精确的短语匹配往往比语义相似的向量匹配更可靠，因为它能找到包含完全相同或高度连续字符串的文档。
+            # 4. 满足特定场景的刚性需求
+            # 专有名词：如“中华人民共和国”、“Microsoft Azure”。
+            # 固定搭配：如“刻舟求剑”、“亡羊补牢”。
+            # 引文/代码：用户搜索特定的报错信息或代码片段，必须精确匹配。
             for i in range(1, len(tks_w)):
                 left, right = tks_w[i - 1][0].strip(), tks_w[i][0].strip()
                 if not left or not right:

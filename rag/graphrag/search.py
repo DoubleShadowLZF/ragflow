@@ -44,6 +44,19 @@ class KGSearch(Dealer):
         return response
 
     async def query_rewrite(self, llm, question, idxnms, kb_ids):
+        """
+        利用LLM从用户问题中提取类型关键词和实体名称，为后续的知识图谱检索做准备。
+        # 无查询重写
+        # 直接使用原始查询检索
+        question = "特斯拉的创始人是谁？"
+        # 检索所有包含"特斯拉"、"创始人"的文档
+
+        # 有查询重写
+        # 提取结构化信息
+        type_keywords = ["人物", "公司", "创始人"]
+        entities = ["特斯拉"]
+        # 在知识图谱中精确检索实体"特斯拉"的"创始人"关系
+        """
         ty2ents = await get_entity_type2samples(idxnms, kb_ids)
         hint_prompt = PROMPTS["minirag_query2kwd"].format(query=question,
                                                           TYPE_POOL=json.dumps(ty2ents, ensure_ascii=False, indent=2))
@@ -160,6 +173,9 @@ class KGSearch(Dealer):
                rel_sim_threshold: float = 0.3,
                   **kwargs
                ):
+        """
+        通过实体识别、关系提取和多跳路径探索，从知识图谱中获取与查询相关的结构化知识，并格式化为增强检索上下文
+        """
         qst = question
         filters = self.get_filters({"kb_ids": kb_ids})
         if isinstance(tenant_ids, str):
@@ -167,6 +183,7 @@ class KGSearch(Dealer):
         idxnms = [index_name(tid) for tid in tenant_ids]
         ty_kwds = []
         try:
+            # 查询重写（Query Rewriting）函数，利用LLM从用户问题中提取类型关键词和实体名称，为后续的知识图谱检索做准备
             ty_kwds, ents = await self.query_rewrite(llm, qst, [index_name(tid) for tid in tenant_ids], kb_ids)
             logging.info(f"Q: {qst}, Types: {ty_kwds}, Entities: {ents}")
         except Exception as e:
@@ -174,10 +191,14 @@ class KGSearch(Dealer):
             ents = [qst]
             pass
 
+        # 路径1：基于关键词的实体检索
         ents_from_query = self.get_relevant_ents_by_keywords(ents, filters, idxnms, kb_ids, emb_mdl, ent_sim_threshold)
+        # 路径2：基于类型的实体检索
         ents_from_types = self.get_relevant_ents_by_types(ty_kwds, filters, idxnms, kb_ids, 10000)
+        # 路径3：基于文本的关系检索
         rels_from_txt = self.get_relevant_relations_by_txt(qst, filters, idxnms, kb_ids, emb_mdl, rel_sim_threshold)
         nhop_pathes = defaultdict(dict)
+        # 多跳路径探索（N-hop Paths）
         for _, ent in ents_from_query.items():
             nhops = ent.get("n_hop_ents", [])
             if not isinstance(nhops, list):
@@ -188,10 +209,12 @@ class KGSearch(Dealer):
                 wts = nbr["weights"]
                 for i in range(len(path) - 1):
                     f, t = path[i], path[i + 1]
+                    #  计算路径权重：距离越远，权重越低
                     if (f, t) in nhop_pathes:
                         nhop_pathes[(f, t)]["sim"] += ent["sim"] / (2 + i)
                     else:
                         nhop_pathes[(f, t)]["sim"] = ent["sim"] / (2 + i)
+                    # 记录最大PageRank
                     nhop_pathes[(f, t)]["pagerank"] = max(
                         nhop_pathes[(f, t)].get("pagerank", 0), wts[i]
                     )
@@ -202,11 +225,13 @@ class KGSearch(Dealer):
         logging.info("Retrieved N-hops: {}".format(list(nhop_pathes.keys())))
 
         # P(E|Q) => P(E) * P(Q|E) => pagerank * sim
+        # 提升类型匹配实体的权重
         for ent in ents_from_types.keys():
             if ent not in ents_from_query:
                 continue
             ents_from_query[ent]["sim"] *= 2
 
+        # 融合关系和实体信息
         for (f, t) in rels_from_txt.keys():
             pair = tuple(sorted([f, t]))
             s = 0
@@ -220,6 +245,7 @@ class KGSearch(Dealer):
             rels_from_txt[(f, t)]["sim"] *= s + 1
 
         # This is for the relations from n-hop but not by query search
+        # 添加未覆盖的多跳关系
         for (f, t) in nhop_pathes.keys():
             s = 0
             if f in ents_from_types:
@@ -231,6 +257,7 @@ class KGSearch(Dealer):
                 "pagerank": nhop_pathes[(f, t)]["pagerank"]
             }
 
+        # 按 sim(语义相似度（来自向量检索）) × pagerank(pagerank：实体的全局重要性) 排序
         ents_from_query = sorted(ents_from_query.items(), key=lambda x: x[1]["sim"] * x[1]["pagerank"], reverse=True)[
                           :ent_topn]
         rels_from_txt = sorted(rels_from_txt.items(), key=lambda x: x[1]["sim"] * x[1]["pagerank"], reverse=True)[
@@ -286,6 +313,7 @@ class KGSearch(Dealer):
         return {
                 "chunk_id": get_uuid(),
                 "content_ltks": "",
+                # 社区检索（Community Retrieval）
                 "content_with_weight": ents + relas + self._community_retrieval_([n for n, _ in ents_from_query], filters, kb_ids, idxnms,
                                                         comm_topn, max_token),
                 "doc_id": "",

@@ -688,10 +688,10 @@ class FileService(CommonService):
         def structured(filename, filetype, blob, content_type):
             nonlocal user_id
             if filetype == FileType.PDF.value:
-                blob = read_potential_broken_pdf(blob)
+                blob = read_potential_broken_pdf(blob) # 修复可能损坏的PDF
 
-            location = get_uuid()
-            FileService.put_blob(user_id, location, blob)
+            location = get_uuid() # 生成唯一ID
+            FileService.put_blob(user_id, location, blob)  # 保存到对象存储
 
             return {
                 "id": location,
@@ -716,6 +716,11 @@ class FileService(CommonService):
             # the validated (hostname, ip) pairs are pinned via Chromium's
             # --host-resolver-rules so the browser cannot re-resolve any of them
             # through a fresh DNS query.
+            # 
+            # 预解析重定向链，防止 SSRF 攻击
+            # 1.预解析重定向链：在浏览器抓取之前，先用 requests 库跟随所有重定向
+            # 2.DNS 预解析与固化：对每个重定向目标，提前解析出 IP 地址并固化
+            # 3.Chromium 主机映射：通过 --host-resolver-rules 参数，让 Chromium 浏览器直接使用预解析的 IP，跳过 DNS 查询
             current_url = url
             current_hostname, current_ip = FileService._validate_url_for_crawl(current_url)
             # Accumulate MAP rules for every hostname we encounter in the chain.
@@ -767,6 +772,10 @@ class FileService(CommonService):
                     verbose=False,
                     extra_args=[f"--host-resolver-rules={_map_rules}"],
                 )
+                # 浏览器抓取配置
+                # 1.使用无头浏览器（headless=True）
+                # 2.启用 PDF 生成，将网页保存为 PDF
+                # 3.使用 PruningContentFilter 过滤无关内容
                 async with AsyncWebCrawler(config=browser_config) as crawler:
                     crawler_config = CrawlerRunConfig(
                         markdown_generator=DefaultMarkdownGenerator(
@@ -783,6 +792,9 @@ class FileService(CommonService):
                     )
                     return result
             page = asyncio.run(adownload())
+            # 处理抓取结果
+            # 1.如果生成了 PDF，保存为 PDF 文件
+            # 2.否则将 Markdown 内容编码为 HTML 格式保存
             if page.pdf:
                 if filename.split(".")[-1].lower() != "pdf":
                     filename += ".pdf"
@@ -790,6 +802,10 @@ class FileService(CommonService):
 
             return structured(filename, "html", str(page.markdown).encode("utf-8"), page.response_headers["content-type"])
 
+        # 本地文件上传分支
+        # 1.对文件进行健康检查（如病毒扫描）
+        # 2.从文件名推断文件类型
+        # 3.读取文件内容并保存
         DocumentService.check_doc_health(user_id, file.filename)
         return structured(file.filename, filename_type(file.filename), file.read(), file.content_type)
 
