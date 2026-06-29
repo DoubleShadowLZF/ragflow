@@ -461,17 +461,30 @@ async def retrieval_test(tenant_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def list_chunks(tenant_id, dataset_id, document_id):
+    """
+    获取指定文档的所有分块信息，支持根据分块 ID 精确查询或通过关键词搜索分块。
+    """
     from rag.nlp import search
 
+    # 权限校验
+    # 1.检查当前用户是否有权访问该数据集
+    # 2.获取数据集所属的租户 ID
     if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
     dataset_tenant_id = _get_dataset_tenant_id(dataset_id)
     if not dataset_tenant_id:
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    # 文档存在性校验
+    # 1.验证文档是否属于该数据集
+    # 2.获取文档元信息用于后续返回
     doc = DocumentService.query(id=document_id, kb_id=dataset_id)
     if not doc:
         return get_error_data_result(message=f"You don't own the document {document_id}.")
     doc = doc[0]
+    # 参数解析
+    # 1.支持分页参数
+    # 2.支持关键词搜索
+    # 3.支持按可用性过滤
     req = request.args
     page = int(req.get("page", 1))
     size = validate_rest_api_page_size(int(req.get("page_size", 30)))
@@ -487,13 +500,21 @@ async def list_chunks(tenant_id, dataset_id, document_id):
         query["available_int"] = 1 if req["available"] == "true" else 0
 
     res = {"total": 0, "chunks": [], "doc": _map_doc(doc)}
+    # 分支一：精确查询（指定 chunk ID）
+    # 1.直接通过 ID 从存储中获取单个分块
+    # 2.验证分块是否属于指定文档
+    # 3.移除运行时字段（如向量）
+    # 4.使用 Pydantic 模型验证数据完整性
     if req.get("id"):
         chunk = settings.docStoreConn.get(req.get("id"), search.index_name(dataset_tenant_id), [dataset_id])
         if not chunk:
             return get_result(message=f"Chunk not found: {dataset_id}/{req.get('id')}", code=RetCode.DATA_ERROR)
         if str(chunk.get("doc_id", chunk.get("document_id"))) != str(document_id):
             return get_result(message=f"Chunk not found: {dataset_id}/{req.get('id')}", code=RetCode.DATA_ERROR)
-        _strip_chunk_runtime_fields(chunk)
+        # 字段映射与清理
+        # 1.清理不必要的字段，减少传输量
+        # 2.统一字段命名（如 chunk_id → id）
+        _strip_chunk_runtime_fields(chunk)  # 移除向量等运行时字段
         res["total"] = 1
         final_chunk = {
             "id": chunk.get("id", chunk.get("chunk_id")),
@@ -510,7 +531,14 @@ async def list_chunks(tenant_id, dataset_id, document_id):
             "tag_feas": chunk.get("tag_feas", {}),
         }
         res["chunks"].append(final_chunk)
+        #  数据验证
+        # 1.使用 Pydantic 模型验证返回数据
+        # 2.确保数据结构符合 API 规范
         _ = Chunk(**final_chunk)
+    # 分支二：搜索查询
+    # 1.检查索引是否存在
+    # 2.使用纯文本搜索（emb_mdl=None）
+    # 3.启用高亮显示匹配内容
     elif settings.docStoreConn.index_exist(search.index_name(dataset_tenant_id), dataset_id):
         sres = await settings.retriever.search(
             query,
@@ -520,11 +548,16 @@ async def list_chunks(tenant_id, dataset_id, document_id):
             highlight=True,
         )
         res["total"] = sres.total
+        # 结果处理
+        # 1.如果有搜索关键词且高亮存在，使用高亮内容
+        # 2.否则使用原始内容
+        # 3.使用 Pydantic 模型验证数据
         for chunk_id in sres.ids:
             d = {
                 "id": chunk_id,
+                # 高亮支持 : 搜索时显示匹配片段
                 "content": (
-                    remove_redundant_spaces(sres.highlight[chunk_id])
+                    remove_redundant_spaces(sres.highlight[chunk_id]) # 去除冗余空格，提高可读性
                     if question and chunk_id in sres.highlight
                     else sres.field[chunk_id].get("content_with_weight", "")
                 ),
@@ -533,6 +566,9 @@ async def list_chunks(tenant_id, dataset_id, document_id):
                 "important_keywords": sres.field[chunk_id].get("important_kwd", []),
                 "tag_kwd": sres.field[chunk_id].get("tag_kwd", []),
                 "questions": sres.field[chunk_id].get("question_kwd", []),
+                # 字段兼容性
+                # 1.兼容不同数据源（ES/Infinity）的字段名差异
+                # 2.保证 API 返回字段一致
                 "dataset_id": sres.field[chunk_id].get("kb_id", sres.field[chunk_id].get("dataset_id")),
                 "image_id": sres.field[chunk_id].get("img_id", ""),
                 "available": bool(int(sres.field[chunk_id].get("available_int", "1"))),
