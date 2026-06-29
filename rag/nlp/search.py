@@ -891,44 +891,72 @@ class Dealer:
         return {a.replace(".", "_"): max(1, c) for a, c in tag_fea}
 
     async def retrieval_by_toc(self, query: str, chunks: list[dict], tenant_ids: list[str], chat_mdl, topn: int = 6):
+        """
+        实现了基于目录（TOC，Table of Contents）的增强检索功能，通过利用文档的目录结构来提升检索效果。
+        核心功能:利用文档的目录（TOC）信息，识别与查询最相关的章节，并提升这些章节下文档块的检索权重，从而实现更精准的召回。
+        """
         from rag.prompts.generator import relevant_chunks_with_toc # moved from the top of the file to avoid circular import
         if not chunks:
             return []
         idx_nms = [index_name(tid) for tid in tenant_ids]
+        # 文档级相关性评分
+        # 1.将检索到的所有块按文档聚合
+        # 2.累加每个文档下所有块的相似度分数
+        # 3.选出分数最高的文档作为目标文档
         ranks, doc_id2kb_id = {}, {}
         for ck in chunks:
             if ck["doc_id"] not in ranks:
                 ranks[ck["doc_id"]] = 0
-            ranks[ck["doc_id"]] += ck["similarity"]
+            ranks[ck["doc_id"]] += ck["similarity"] # 累加文档下所有块的相关性
             doc_id2kb_id[ck["doc_id"]] = ck["kb_id"]
+        # 选出相关性最高的文档
         doc_id = sorted(ranks.items(), key=lambda x: x[1] * -1.)[0][0]
+        #  获取文档目录（TOC）： 查询该文档的目录信息（toc_kwd: "toc"）
         kb_ids = [doc_id2kb_id[doc_id]]
-        es_res = self.dataStore.search(["content_with_weight"], [], {"doc_id": doc_id, "toc_kwd": "toc"}, [],
-                                       OrderByExpr(), 0, 128, idx_nms,
-                                       kb_ids)
+        es_res = self.dataStore.search(["content_with_weight"] # 只返回内容字段
+                                       , [] # 不高亮
+                                       , {"doc_id": doc_id, "toc_kwd": "toc"}  # 过滤条件
+                                       , []
+                                       , OrderByExpr()
+                                       , 0
+                                       , 128
+                                       , idx_nms
+                                       , kb_ids)
         toc = []
+        # 目录以 JSON 格式存储在 content_with_weight 中
         dict_chunks = self.dataStore.get_fields(es_res, ["content_with_weight"])
         for _, doc in dict_chunks.items():
             try:
+                # 解析 JSON 得到目录结构列表
                 toc.extend(json.loads(doc["content_with_weight"]))
             except Exception as e:
                 logging.exception(e)
         if not toc:
             return chunks
 
+        # LLM 选择相关章节
+        # 调用 LLM 分析用户查询和目录结构
+        # 找出与查询最相关的章节标题/ID
+        # topn * 2 表示候选章节数量
         ids = await relevant_chunks_with_toc(query, toc, chat_mdl, topn * 2)
         if not ids:
-            return chunks
+            return chunks # 无相关章节，返回原始结果
 
+        # 提升相关章节的权重
+        # 1.如果相关章节的块已经在检索结果中，提升其相似度分数
+        # 2.如果不在结果中，从索引中获取并添加到结果列表
         vector_size = 1024
         id2idx = {ck["chunk_id"]: i for i, ck in enumerate(chunks)}
         for cid, sim in ids:
             if cid in id2idx:
+                # 如果该块已在结果中，增加其相似度
                 chunks[id2idx[cid]]["similarity"] += sim
                 continue
+            # 否则，从索引中获取该块
             chunk = self.dataStore.get(cid, idx_nms[0], kb_ids)
             if not chunk:
                 continue
+            # 构建完整的块数据
             d = {
                 "chunk_id": cid,
                 "content_ltks": chunk["content_ltks"],
@@ -952,6 +980,9 @@ class Dealer:
                     break
             chunks.append(d)
 
+        # 排序与截断
+        # 1.按相似度降序排序
+        # 2.只返回前 topn 个块
         return sorted(chunks, key=lambda x: x["similarity"] * -1)[:topn]
 
     def retrieval_by_children(self, chunks: list[dict], tenant_ids: list[str]):

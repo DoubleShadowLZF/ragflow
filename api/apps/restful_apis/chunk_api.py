@@ -297,15 +297,41 @@ async def stop_parsing(tenant_id, dataset_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def retrieval_test(tenant_id):
+    """
+    提供一个完整的 RAG 检索测试接口，支持混合检索、知识图谱、目录增强、元数据过滤等多种高级特性。
+
+    关键设计特点
+    特性	            说明
+    多数据集检索	    同时检索多个数据集，必须使用同一 Embedding 模型
+    混合检索	        向量 + 全文，权重可调
+    多路增强	        关键词提取、多语言翻译、知识图谱、目录增强
+    元数据过滤	    支持复杂的元数据条件过滤
+    父子文档聚合	    将子文档聚合为父文档
+    重排序	        支持配置重排序模型
+
+    总结
+    这个 retrieval_test API 是 RAGFlow 检索能力的完整展示，它：
+    完整的权限控制：    多租户隔离
+    丰富的检索策略：    混合检索 + 多路增强
+    灵活的参数配置：    阈值、权重、增强选项
+    完善的后处理：     聚合、过滤、格式化
+    """
     req = await get_request_json()
+    # 权限与参数校验
+    # 校验数据集ID
     if not req.get("dataset_ids"):
         return get_error_data_result("`dataset_ids` is required.")
     kb_ids = req["dataset_ids"]
     if not isinstance(kb_ids, list):
         return get_error_data_result("`dataset_ids` should be a list")
+    # 权限校验：检查用户是否拥有所有数据集
     for id in kb_ids:
         if not KnowledgebaseService.accessible(kb_id=id, user_id=tenant_id):
             return get_error_data_result(f"You don't own the dataset {id}.")
+    # Embedding 模型一致性校验
+    # 为什么要校验？
+    # 1.多个数据集必须使用相同的 Embedding 模型
+    # 2.否则无法在同一向量空间中进行检索
     kbs = KnowledgebaseService.get_by_ids(kb_ids)
     embd_nms = list(set([split_model_name(kb.embd_id)[0] for kb in kbs]))
     if len(embd_nms) != 1:
@@ -323,28 +349,33 @@ async def retrieval_test(tenant_id):
     langs = req.get("cross_languages", [])
     if not isinstance(doc_ids, list):
         return get_error_data_result("`documents` should be a list")
+    # 文档过滤预处理
+    # 如果指定了文档ID，校验这些文档是否属于这些数据集
     if doc_ids:
         doc_ids_list = KnowledgebaseService.list_documents_by_ids(kb_ids)
         for doc_id in doc_ids:
             if doc_id not in doc_ids_list:
                 return get_error_data_result(f"The datasets don't own the document {doc_id}")
+    # 如果没有指定文档ID，通过元数据过滤获得文档ID
     if not doc_ids:
         metadata_condition = req.get("metadata_condition")
         if metadata_condition:
+            # 加载元数据并应用过滤
             metas = DocMetadataService.get_flatted_meta_by_kbs(kb_ids)
             doc_ids = meta_filter(metas, convert_conditions(metadata_condition), metadata_condition.get("logic", "and"))
             if not doc_ids and metadata_condition.get("conditions"):
                 return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
             if metadata_condition and not doc_ids:
-                doc_ids = ["-999"]
+                doc_ids = ["-999"] # 特殊标记：过滤后无结果
         else:
             doc_ids = None
+    # 参数解析
     similarity_threshold = float(req.get("similarity_threshold", 0.2))
     vector_similarity_weight = float(req.get("vector_similarity_weight", 0.3))
     top = int(req.get("top_k", 1024))
     if top <= 0:
         return get_error_data_result("`top_k` must be greater than 0")
-    highlight_val = req.get("highlight", None)
+    highlight_val = req.get("highlight", None) # 高亮配置
     if highlight_val is None:
         highlight = False
     elif isinstance(highlight_val, bool):
@@ -353,12 +384,13 @@ async def retrieval_test(tenant_id):
         highlight = highlight_val.lower() == "true"
     else:
         return get_error_data_result("`highlight` should be a boolean")
-    include_metadata, metadata_fields = _resolve_reference_metadata(req)
+    include_metadata, metadata_fields = _resolve_reference_metadata(req) # 元数据字段
     try:
         tenant_ids = list(set([kb.tenant_id for kb in kbs]))
         e, kb = KnowledgebaseService.get_by_id(kb_ids[0])
         if not e:
             return get_error_data_result(message="Dataset not found!")
+        # 模型初始化
         embd_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.EMBEDDING, kb.embd_id)
         embd_mdl = LLMBundle(kb.tenant_id, embd_model_config)
 
@@ -367,35 +399,47 @@ async def retrieval_test(tenant_id):
             rerank_model_config = get_model_config_from_provider_instance(kb.tenant_id, LLMType.RERANK, req["rerank_id"])
             rerank_mdl = LLMBundle(kb.tenant_id, rerank_model_config)
 
+        # 查询增强
+        # 多语言翻译
         if langs:
             question = await cross_languages(kb.tenant_id, None, question, langs)
+        # 关键词提取
         if req.get("keyword", False):
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
             question += await keyword_extraction(LLMBundle(kb.tenant_id, chat_model_config), question)
 
+        # 核心检索
         ranks = await settings.retriever.retrieval(
             question, embd_mdl, tenant_ids, kb_ids, page, size, similarity_threshold,
             vector_similarity_weight, top, doc_ids, rerank_mdl=rerank_mdl,
             highlight=highlight, rank_feature=label_question(question, kbs),
         )
+        # 后处理与增强
+        # 目录增强（TOC）
         if toc_enhance:
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
             cks = await settings.retriever.retrieval_by_toc(question, ranks["chunks"], tenant_ids, LLMBundle(kb.tenant_id, chat_model_config), size)
             if cks:
                 ranks["chunks"] = cks
+        # 父子文档聚合
         ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)
+        # 知识图谱检索
         if use_kg:
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
             ck = await settings.kg_retriever.retrieval(question, [k.tenant_id for k in kbs], kb_ids, embd_mdl, LLMBundle(kb.tenant_id, chat_model_config))
             if ck["content_with_weight"]:
                 ranks["chunks"].insert(0, ck)
 
+        # 结果格式化
+        # 移除向量数据
         for c in ranks["chunks"]:
             c.pop("vector", None)
+        # 元数据增强
         if include_metadata:
             logging.info("sdk.retrieval reference_metadata enabled dataset_ids=%s fields=%s chunks=%s", kb_ids, sorted(metadata_fields) if metadata_fields else None, len(ranks["chunks"]))
             enrich_chunks_with_document_metadata(ranks["chunks"], metadata_fields)
 
+        # 字段映射（API 友好）
         key_mapping = {
             "chunk_id": "id",
             "content_with_weight": "content",

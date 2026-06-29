@@ -67,7 +67,17 @@ def chunks_format(reference):
 
 
 def message_fit_in(msg, max_length=4000):
+    """
+    根据模型的最大上下文长度（max_length），动态裁剪对话消息列表，确保总 token 数不超过限制。
+    """
     def count():
+        """
+        计算消息总 token 数
+
+        1.遍历所有消息
+        2.使用 num_tokens_from_string 计算每条消息的 token 数
+        3.累加得到总 token 数
+        """
         nonlocal msg
         tks_cnts = []
         for m in msg:
@@ -78,13 +88,27 @@ def message_fit_in(msg, max_length=4000):
         return total
 
     def trim_content(content, limit):
+        """
+         按 token 数截断内容
+
+        1.使用编码器将内容编码为 token 列表
+        2.取前 limit 个 token
+        3.解码回字符串
+        """
         limit = max(0, limit)
         return encoder.decode(encoder.encode(content)[:limit])
 
+    # 第一次检查：消息未超限
     c = count()
     if c < max_length:
         return c, msg
 
+    # 第一次裁剪：保留系统和最后一条消息
+    # 裁剪策略：
+    # 消息类型	保留/丢弃	说明
+    # 系统消息	✅ 保留	    包含重要指令
+    # 中间消息	❌ 丢弃	    历史对话，非关键
+    # 最后消息	✅ 保留	    最新的用户输入
     msg_ = [m for m in msg if m["role"] == "system"]
     if len(msg) > 1:
         msg_.append(msg[-1])
@@ -93,9 +117,11 @@ def message_fit_in(msg, max_length=4000):
     if c < max_length:
         return c, msg
 
-    ll = num_tokens_from_string(msg_[0]["content"])
-    ll2 = num_tokens_from_string(msg_[-1]["content"])
+    # 第二次裁剪：按比例截断内容
+    ll = num_tokens_from_string(msg_[0]["content"]) # 系统消息 token 数
+    ll2 = num_tokens_from_string(msg_[-1]["content"])  # 最后消息（用户最后一条消息） token 数
     total = ll + ll2
+    # total == 0：所有消息为空，直接返回
     if total <= 0:
         logging.debug(
             "message_fit_in degenerate token counts total=%s max_length=%s ll=%s ll2=%s preserved_roles=%s",
@@ -107,10 +133,30 @@ def message_fit_in(msg, max_length=4000):
         )
         return 0, msg
 
+    # len(msg) == 1：只有一条消息，直接裁剪前 max_length 个字符
     if len(msg) == 1:
         msg[0]["content"] = trim_content(msg[0]["content"], max_length)
         return count(), msg
 
+    #  智能比例裁剪
+    # 分支 A：系统消息占比 > 80%
+    # 策略：系统消息占绝大多数时，优先保证系统消息的完整性，裁剪用户消息。
+    #
+    # 这如何体现“优先保留系统消息”？
+    # 这其实是该分支策略在极端情况下的“安全兜底”机制，而非其核心意图。我们来分两种场景看：
+    # 常规情况（用户消息远小于总限制）：
+    # 此时 ll2 < max_length，preserved_last = ll2（用户消息完整保留）。
+    # remaining 会是一个较大的正数，系统消息可以保留这个长度的内容。
+    # 结果：系统消息占用了大部分上下文预算，确实实现了优先保留系统消息。
+    # 极端情况（用户消息超长）：
+    # 此时 ll2 >= max_length，preserved_last = max_length。
+    # remaining = 0，系统消息被完全丢弃。
+    # 结果：这个分支最终只剩下了用户消息。
+    #
+    # 为什么会有这种看似“自相矛盾”的设计？
+    # 这个设计透露出两个关键考量：
+    # 这是一个“尽最大努力”的策略，而非“保证”：分支 A 的逻辑是在允许的范围内，优先将预算分配给系统消息。只有当用户消息的长度已经超过总限制时，这个“优先权”才无法生效。
+    # 保证程序不会崩溃是首要任务：无论系统消息多么重要，一个包含 "role": "system" 和 "role": "user" 的、完整格式的消息对调用 LLM 来说是必须的。因此，即使要完全丢弃系统消息，也必须保留部分用户消息，以确保最终构造的 msg 列表在格式上是有效的，让程序能继续运行，不至于因消息为空而直接崩溃。
     if ll / total > 0.8:
         preserved_last = min(ll2, max_length)
         msg[-1]["content"] = trim_content(msg_[-1]["content"], preserved_last)
@@ -118,6 +164,8 @@ def message_fit_in(msg, max_length=4000):
         msg[0]["content"] = trim_content(msg_[0]["content"], remaining)
         return count(), msg
 
+    # 分支 B：默认比例分配
+    # 策略：按比例分配，系统消息和用户消息各占一部分。
     preserved_system = min(ll, max_length)
     msg[0]["content"] = trim_content(msg_[0]["content"], preserved_system)
     remaining = max(0, max_length - preserved_system)
@@ -543,19 +591,43 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
 
 
 async def gen_json(system_prompt: str, user_prompt: str, chat_mdl, gen_conf={}, max_retry=2):
+    """
+    调用 LLM 生成 JSON 格式的响应，并自带缓存、重试和格式修复机制，确保返回有效的 JSON 对象。
+
+    1.智能缓存：避免重复调用，降低成本
+    2.自我修正：利用 LLM 自我纠错能力
+    3.容错解析：使用 json_repair 处理格式问题
+    4.格式清理：兼容多种 LLM 输出格式
+    """
     from rag.graphrag.utils import get_llm_cache, set_llm_cache
+    # 检查缓存
+    # 1.使用相同的模型、提示词和配置作为缓存键
+    # 2.缓存命中时跳过 LLM 调用，节省成本和时间
     cached = get_llm_cache(chat_mdl.llm_name, system_prompt, user_prompt, gen_conf)
     if cached:
+        # 使用 json_repair 解析缓存数据（增强容错）
         return json_repair.loads(cached)
+    # 构建消息并适配上下文
+    # 1.form_message：将系统提示词和用户提示词组合为消息列表
+    # 2.message_fit_in：根据模型的最大上下文长度适配消息
+    # 3.确保消息不超出模型限制
     _, msg = message_fit_in(form_message(system_prompt, user_prompt), chat_mdl.max_length)
     err = ""
     ans = ""
+    # 重试循环（含自我修正）
+    # 1.第一次尝试：正常调用 LLM
+    # 2.后续重试：将错误信息反馈给 LLM，要求修正
     for _ in range(max_retry):
         if ans and err:
             msg[-1]["content"] += f"\nGenerated JSON is as following:\n{ans}\nBut exception while loading:\n{err}\nPlease reconsider and correct it."
         ans = await chat_mdl.async_chat(msg[0]["content"], msg[1:], gen_conf=gen_conf)
+        # 清理 LLM 输出
         ans = re.sub(r"(^.*</think>|```json\n|```\n*$)", "", ans, flags=re.DOTALL)
         try:
+            # 解析 JSON 并缓存
+            # 1.使用 json_repair 而非标准 json.loads，容错更强
+            # 2.解析成功后写入缓存
+            # 3.解析失败时记录错误信息，进入下一次重试
             res = json_repair.loads(ans)
             set_llm_cache(chat_mdl.llm_name, system_prompt, ans, user_prompt, gen_conf)
             return res
@@ -925,26 +997,54 @@ async def run_toc_from_text(chunks, chat_mdl, callback=None):
     return merged
 
 
+# 加载提示词模板
+# system：系统提示词，定义 LLM 的角色和任务
+# user：用户提示词，包含查询和目录数据
 TOC_RELEVANCE_SYSTEM = load_prompt("toc_relevance_system")
 TOC_RELEVANCE_USER = load_prompt("toc_relevance_user")
 async def relevant_chunks_with_toc(query: str, toc: list[dict], chat_mdl, topn: int = 6):
+    """
+    实现了基于目录（TOC）的相关章节选择功能，它使用 LLM 分析用户查询与文档目录结构，智能地识别出与查询最相关的章节。
+    核心功能 : 利用 LLM 对用户查询和文档目录进行语义分析，为每个目录章节打分，选出与查询最相关的章节及其 ID。
+    """
     import numpy as np
     try:
+        # 调用 LLM 生成评分
+        # 1.gen_json 是封装的 LLM 调用函数，返回 JSON 格式结果
+        # 2.temperature=0.0：保证输出确定性
+        # 3.top_p=0.9：核采样策略
         ans = await gen_json(
             PROMPT_JINJA_ENV.from_string(TOC_RELEVANCE_SYSTEM).render(),
-            PROMPT_JINJA_ENV.from_string(TOC_RELEVANCE_USER).render(query=query, toc_json="[\n%s\n]\n" % "\n".join(
-                [json.dumps({"level": d["level"], "title": d["title"]}, ensure_ascii=False) for d in toc])),
+            PROMPT_JINJA_ENV.from_string(TOC_RELEVANCE_USER).render(
+                query=query
+                # 构建目录 JSON 数据
+                # 1.从目录列表中提取 level 和 title 字段
+                # 2.构建为 JSON 数组格式，每行一个章节
+                , toc_json="[\n%s\n]\n" % "\n".join([
+                    json.dumps({"level": d["level"] , "title": d["title"]} , ensure_ascii=False)
+                    for d in toc
+                ])
+            ),
             chat_mdl,
             gen_conf={"temperature": 0.0, "top_p": 0.9}
         )
+        # 解析 LLM 响应
         id2score = {}
+        # 遍历目录和评分结果
         for ti, sc in zip(toc, ans):
+            # 评分阈值：必须 >= 1（LLM 评分范围 1-5）
             if not isinstance(sc, dict) or sc.get("score", -1) < 1:
                 continue
+            # 将章节评分映射到每个章节下的所有块 ID
             for id in ti.get("ids", []):
                 if id not in id2score:
                     id2score[id] = []
+                # 评分归一化：score / 5（将 1-5 映射到 0.2-1.0）
                 id2score[id].append(sc["score"] / 5.)
+        # 计算平均分数并过滤
+        # 1.如果一个块属于多个相关章节，取评分的平均值
+        # 2.过滤出评分 >= 0.3 的块
+        # 3.按评分降序排列，返回前 topn 个
         for id in id2score.keys():
             id2score[id] = np.mean(id2score[id])
         return [(id, sc) for id, sc in list(id2score.items()) if sc >= 0.3][:topn]
