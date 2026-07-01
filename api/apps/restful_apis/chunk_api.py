@@ -608,17 +608,33 @@ async def get_chunk(tenant_id, dataset_id, document_id, chunk_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def add_chunk(tenant_id, dataset_id, document_id):
+    """
+    向知识库的数据集中添加文档块（chunk）
+    将文档切分成更小的语义单元（块），每个块包含：
+    文本内容（必填）
+    重要关键词（可选）
+    关联问题（可选）
+    标签（可选）
+    图片（可选）
+
+    块会被向量化存储，便于后续的语义检索和RAG（检索增强生成）应用。
+    """
     from rag.nlp import rag_tokenizer, search
 
+    # 权限验证:检查当前用户是否有权限访问该数据集
     if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
     dataset_tenant_id = _get_dataset_tenant_id(dataset_id)
     if not dataset_tenant_id:
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    # 文档验证:验证文档是否存在且属于该数据集
     doc = DocumentService.query(id=document_id, kb_id=dataset_id)
     if not doc:
         return get_error_data_result(message=f"You don't own the document {document_id}.")
     doc = doc[0]
+    # 请求数据验证
+    # 1.检查必填字段content
+    # 2.验证important_keywords和questions是否为列表类型
     req = await get_request_json()
     if is_content_empty(req.get("content")):
         return get_error_data_result(message="`content` is required")
@@ -627,7 +643,13 @@ async def add_chunk(tenant_id, dataset_id, document_id):
     if "questions" in req and not isinstance(req["questions"], list):
         return get_error_data_result("`questions` is required to be a list")
 
+    # 生成块ID:使用xxhash算法根据内容和文档ID生成唯一ID
     chunk_id = xxhash.xxh64((req["content"] + document_id).encode("utf-8")).hexdigest()
+    # 构建块数据
+    # 分词处理：使用RAG分词器进行文本处理
+    # 精细分词：fine_grained_tokenize进行更细粒度的分词
+    # 关键词处理：提取重要关键词
+    # 问题处理：处理关联问题列表
     d = {
         "id": chunk_id,
         "content_ltks": rag_tokenizer.tokenize(req["content"]),
@@ -644,18 +666,22 @@ async def add_chunk(tenant_id, dataset_id, document_id):
     d["docnm_kwd"] = doc.name
     d["doc_id"] = document_id
 
+    # 可选字段处理
+    # tag_kwd：标签列表
     if "tag_kwd" in req:
         if not isinstance(req["tag_kwd"], list):
             return get_error_data_result("`tag_kwd` is required to be a list")
         if not all(isinstance(t, str) for t in req["tag_kwd"]):
             return get_error_data_result("`tag_kwd` must be a list of strings")
         d["tag_kwd"] = req["tag_kwd"]
+    # tag_feas：标签特征（需验证）
     if "tag_feas" in req:
         try:
             d["tag_feas"] = validate_tag_features(req["tag_feas"])
         except ValueError as exc:
             return get_error_data_result(f"`tag_feas` {exc}")
 
+    # image_base64：图片数据（会存储图片，标记为图片类型）
     if "image_base64" in req:
         image_binary, image_err = _decode_chunk_image_base64(req.get("image_base64"))
         if image_err:
@@ -668,13 +694,23 @@ async def add_chunk(tenant_id, dataset_id, document_id):
 
     embd_id = DocumentService.get_embd_id(document_id)
     model_config = get_model_config_from_provider_instance(dataset_tenant_id, LLMType.EMBEDDING.value, embd_id)
+    # 向量化处理（核心）
+    # 1.获取嵌入模型配置
+    # 2.对文档名和内容（或问题列表）进行向量化
+    # 3.使用加权组合生成最终向量
     embd_mdl = TenantLLMService.model_instance(model_config)
     v, c = embd_mdl.encode([doc.name, req["content"] if not d["question_kwd"] else "\n".join(d["question_kwd"])])
-    v = 0.1 * v[0] + 0.9 * v[1]
+    v = 0.1 * v[0] + 0.9 * v[1] # 加权组合：10%文档名 + 90%内容/问题
     d[f"q_{len(v)}_vec"] = v.tolist()
+    # 存储
+    # 1.将块数据存入文档存储
+    # 2.更新文档的块数量
     settings.docStoreConn.insert([d], search.index_name(dataset_tenant_id), dataset_id)
 
     DocumentService.increment_chunk_num(doc.id, doc.kb_id, c, 1, 0)
+    # 返回结果
+    # 1.将内部字段名映射为API友好的字段名
+    # 2.返回创建的块信息
     key_mapping = {
         "id": "id",
         "content_with_weight": "content",
@@ -697,8 +733,14 @@ async def add_chunk(tenant_id, dataset_id, document_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def rm_chunk(tenant_id, dataset_id, document_id):
+    """
+    删除文档块（chunks）
+    """
     from rag.nlp import search
 
+    # 权限验证
+    # 1.验证用户对数据集的访问权限
+    # 2.验证文档是否存在
     if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
     dataset_tenant_id = _get_dataset_tenant_id(dataset_id)
@@ -707,12 +749,20 @@ async def rm_chunk(tenant_id, dataset_id, document_id):
     docs = DocumentService.query(id=document_id, kb_id=dataset_id)
     if not docs:
         return get_error_data_result(message=f"You don't own the document {document_id}.")
+    # 请求参数处理
+    # 1.获取请求体JSON数据
+    # 2.如果没有请求体，直接返回（静默成功）
     req = await get_request_json()
     if not req:
         return get_result()
 
     chunk_ids = req.get("chunk_ids")
     if not chunk_ids:
+        # 删除模式选择
+        # 模式一：删除所有块（批量删除）
+        # 1.删除文档关联的所有块图片
+        # 2.从文档存储中删除该文档的所有块
+        # 3.更新文档的块数量（减去删除的数量）
         if req.get("delete_all") is True:
             doc = docs[0]
             DocumentService.delete_chunk_images(doc, dataset_tenant_id)
@@ -720,9 +770,18 @@ async def rm_chunk(tenant_id, dataset_id, document_id):
             if chunk_number != 0:
                 DocumentService.decrement_chunk_num(document_id, dataset_id, 1, chunk_number, 0)
             return get_result(message=f"deleted {chunk_number} chunks")
+        # 模式二：删除指定块（精确删除）
+        # 如果没有提供chunk_ids且delete_all不为true，直接返回
         return get_result()
 
+    # 去重处理:返回唯一ID列表和重复ID的错误信息
     unique_chunk_ids, duplicate_messages = check_duplicate_ids(chunk_ids, "chunk")
+    # 执行删除
+    # 1.根据文档ID和块ID列表进行删除
+    # 2.返回实际删除的数量
+    # 事务完整性
+    # 1.删除块时同步删除关联的图片
+    # 2.更新文档的统计信息
     chunk_number = settings.docStoreConn.delete(
         {"doc_id": document_id, "id": unique_chunk_ids},
         search.index_name(dataset_tenant_id),
@@ -730,15 +789,19 @@ async def rm_chunk(tenant_id, dataset_id, document_id):
     )
     if chunk_number != 0:
         DocumentService.decrement_chunk_num(document_id, dataset_id, 1, chunk_number, 0)
+    # 结果验证和返回
+    # 情况一：如果实际删除数量不等于预期数量，返回错误
     if chunk_number != len(unique_chunk_ids):
         if len(unique_chunk_ids) == 0:
             return get_result(message=f"deleted {chunk_number} chunks")
         return get_error_data_result(message=f"rm_chunk deleted chunks {chunk_number}, expect {len(unique_chunk_ids)}")
+    # 部分成功但有重复ID,返回部分成功的信息
     if duplicate_messages:
         return get_result(
             message=f"Partially deleted {chunk_number} chunks with {len(duplicate_messages)} errors",
             data={"success_count": chunk_number, "errors": duplicate_messages},
         )
+    # 完全成功
     return get_result(message=f"deleted {chunk_number} chunks")
 
 
@@ -746,41 +809,63 @@ async def rm_chunk(tenant_id, dataset_id, document_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def update_chunk(tenant_id, dataset_id, document_id, chunk_id):
+    """
+    更新文档块（chunk）的API端点，支持部分字段更新
+    """
     from rag.app.qa import beAdoc, rmPrefix
     from rag.nlp import rag_tokenizer, search
 
+    # 权限和资源验证
+    # 验证数据集权限
     if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
     dataset_tenant_id = _get_dataset_tenant_id(dataset_id)
     if not dataset_tenant_id:
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
+    # 验证文档存在
     doc = DocumentService.query(id=document_id, kb_id=dataset_id)
     if not doc:
         return get_error_data_result(message=f"You don't own the document {document_id}.")
     doc = doc[0]
+    # 验证块存在且属于该文档
     chunk = settings.docStoreConn.get(chunk_id, search.index_name(dataset_tenant_id), [dataset_id])
     if chunk is None or str(chunk.get("doc_id", chunk.get("document_id"))) != str(document_id):
         return get_error_data_result(f"Can't find this chunk {chunk_id}")
     req = await get_request_json()
+    # 内容更新处理
+    # 1.如果提供了新内容，验证非空
+    # 2.如果未提供，保留原内容
     content = req.get("content")
     if content is not None:
         if is_content_empty(content):
             return get_error_data_result(message="`content` is required")
     else:
         content = chunk.get("content_with_weight", "")
+    # 文本分词处理
+    # 1.对内容进行标准分词
+    # 2.进行细粒度分词（用于更精确的检索）
     d = {"id": chunk_id, "content_with_weight": content}
     d["content_ltks"] = rag_tokenizer.tokenize(d["content_with_weight"])
     d["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(d["content_ltks"])
+    # 可选字段更新
+    # 关键词更新
     if "important_keywords" in req:
         if not isinstance(req["important_keywords"], list):
             return get_error_data_result("`important_keywords` should be a list")
         d["important_kwd"] = req.get("important_keywords", [])
         d["important_tks"] = rag_tokenizer.tokenize(" ".join(req["important_keywords"]))
+    # 问题更新
     if "questions" in req:
         if not isinstance(req["questions"], list):
             return get_error_data_result("`questions` should be a list")
         d["question_kwd"] = [str(q).strip() for q in req.get("questions", []) if str(q).strip()]
         d["question_tks"] = rag_tokenizer.tokenize("\n".join(req["questions"]))
+    # 字段	        类型	        说明
+    # available	    bool	    是否可用
+    # positions	    list	    位置信息
+    # tag_kwd	    list[str]	标签列表
+    # tag_feas	    dict	    标签特征
+    # image_base64	string	    图片（Base64编码）
     if "available" in req:
         d["available_int"] = int(req["available"])
     if "positions" in req:
@@ -811,6 +896,10 @@ async def update_chunk(tenant_id, dataset_id, document_id, chunk_id):
     embd_id = DocumentService.get_embd_id(document_id)
     model_config = get_model_config_from_provider_instance(dataset_tenant_id, LLMType.EMBEDDING.value, embd_id)
     embd_mdl = TenantLLMService.model_instance(model_config)
+    # QA模式特殊处理:直接使用内容向量（问题部分）
+    # 1.解析问答对格式（用Tab或换行分隔）
+    # 2.移除前缀（如"Q:"、"A:"）
+    # 3.标记是否为中文内容
     if doc.parser_id == ParserType.QA:
         arr = [t for t in re.split(r"[\n\t]", d["content_with_weight"]) if len(t) > 1]
         if len(arr) != 2:
@@ -818,14 +907,21 @@ async def update_chunk(tenant_id, dataset_id, document_id, chunk_id):
         q, a = rmPrefix(arr[0]), rmPrefix(arr[1])
         d = beAdoc(d, arr[0], arr[1], not any([rag_tokenizer.is_chinese(t) for t in q + a]))
 
+    # 向量更新（核心）：即使只更新内容，也会重新生成向量
+    # 原因：内容变化影响语义向量，必须重新计算
     v, _ = embd_mdl.encode(
         [
-            doc.name,
+            doc.name, # 文档名
             d["content_with_weight"] if not d.get("question_kwd") else "\n".join(d["question_kwd"]),
         ]
     )
+    # 不同模式使用不同的加权策略
+    # 普通模式：10%文档名 + 90%内容（或问题）
     v = 0.1 * v[0] + 0.9 * v[1] if doc.parser_id != ParserType.QA else v[1]
     d[f"q_{len(v)}_vec"] = v.tolist()
+    # 执行更新
+    # 1.根据块ID更新ES文档
+    # 2.更新所有提供的字段
     settings.docStoreConn.update({"id": chunk_id}, d, search.index_name(dataset_tenant_id), dataset_id)
     return get_result()
 
@@ -834,21 +930,32 @@ async def update_chunk(tenant_id, dataset_id, document_id, chunk_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def switch_chunks(tenant_id, dataset_id, document_id):
+    """
+    批量更新文档块可用状态的API端点。它允许用户一次性切换多个块的启用/禁用状态。
+    """
     from rag.nlp import search
 
+    # 权限验证
     if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
     dataset_tenant_id = _get_dataset_tenant_id(dataset_id)
     if not dataset_tenant_id:
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
     req = await get_request_json()
+    # 请求参数验证
     if not req.get("chunk_ids"):
         return get_error_data_result(message="`chunk_ids` is required.")
     if "available_int" not in req and "available" not in req:
         return get_error_data_result(message="`available_int` or `available` is required.")
+    # 状态值处理
+    # 优先使用available_int（整数）
+    # 其次使用available（布尔值）
+    # 转换为整数：1（可用）或 0（不可用）
     available_int = int(req["available_int"]) if "available_int" in req else (1 if req.get("available") else 0)
 
     try:
+        # 核心更新逻辑（同步执行）
+        # 使用thread_pool_exec在独立线程中执行，避免阻塞异步事件循环：
         def _switch_sync():
             e, doc = DocumentService.get_by_id(document_id)
             if not e:

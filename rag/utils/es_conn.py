@@ -65,6 +65,11 @@ class ESConnection(ESConnectionBase):
     """
 
     def _es_search_once(self, index_names: list[str], query: dict, track_total_hits: bool):
+        """
+        单次ES搜索
+        """
+        # 支持超时设置（600秒）
+        # 控制是否跟踪总命中数
         return self.es.search(
             index=index_names,
             body=query,
@@ -73,6 +78,12 @@ class ESConnection(ESConnectionBase):
         )
 
     def _search_with_search_after(self, index_names: list[str], query: dict, offset: int, limit: int):
+        """
+        深度分页方法 : ES默认的from+size分页有深度限制（默认10000条），对于大数据集分页会报错。
+        工作原理:
+        第一次请求: 获取前N条，记录最后一条的sort值作为游标
+        后续请求: 使用search_after参数从游标位置继续获取
+        """
         q_base = copy.deepcopy(query)
         q_base.pop("from", None)
         q_base.pop("size", None)
@@ -84,6 +95,7 @@ class ESConnection(ESConnectionBase):
         remaining_take = max(0, limit)
         with_aggs = True
 
+        # 阶段1：跳过前offset条（跳过阶段）
         # 每次从上一批次的最后一条文档获取 sort 值作为新的游标
         # 累进减少 remaining_skip
         # 第一次请求保存 template_res（包含 total 信息）
@@ -97,20 +109,31 @@ class ESConnection(ESConnectionBase):
             if not with_aggs:
                 q_iter.pop("aggs", None)
             res = self._es_search_once(index_names, q_iter, track_total_hits=template_res is None)
+
+            # 第一次请求保存template_res（包含总数等元数据）
             if template_res is None:
                 template_res = res
+
+            # 获取本次结果
             hits = res.get("hits", {}).get("hits", [])
             if not hits:
                 break
+
+            # 更新游标到最后一条
             next_search_after = hits[-1].get("sort")
             if not next_search_after or next_search_after == search_after:
                 break
             search_after = next_search_after
             remaining_skip -= len(hits)
+            # 优化技巧：
+            # 跳过阶段禁用聚合（with_aggs=False）提升性能
+            # 只在第一次请求时计算总数
+            # 分批获取，避免内存溢出
             with_aggs = False
             if len(hits) < batch:
                 break
 
+        # 阶段2：获取实际数据（取数阶段）
         while remaining_skip <= 0 and remaining_take > 0:
             batch = min(SEARCH_AFTER_BATCH_SIZE, remaining_take)
             q_iter = copy.deepcopy(q_base)
@@ -125,6 +148,7 @@ class ESConnection(ESConnectionBase):
             hits = res.get("hits", {}).get("hits", [])
             if not hits:
                 break
+            # 同样使用search_after继续获取
             collected_hits.extend(hits)
             remaining_take -= len(hits)
             next_search_after = hits[-1].get("sort")
@@ -157,16 +181,42 @@ class ESConnection(ESConnectionBase):
     ):
         """
         Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl.html
+
+        主搜索接口
+
+        搜索策略决策树
+        是否超过深度分页限制(10000)？
+        ├─ 否 → 使用普通分页 (from+size)
+        └─ 是 → 是否有排序条件？
+            ├─ 否 → 普通分页（可能报错）
+            └─ 是 → 是否为向量搜索？
+                ├─ 是 → 普通分页（knn不支持search_after）
+                └─ 否 → 使用search_after深度分页
+
+        :param select_fields:                  # 要返回的字段
+        :param highlight_fields:               # 高亮字段
+        :param condition:                      # 过滤条件
+        :param match_expressions:              # 匹配表达式（文本/向量）
+        :param order_by:                       # 排序规则
+        :param offset:                         # 偏移量
+        :param limit:                          # 限制条数
+        :param index_names:                    # 索引名
+        :param knowledgebase_ids:              # 知识库ID（数据隔离）
+        :param agg_fields:                     # 聚合字段
+        :param rank_feature:                   # 排序特征
+        :return:
         """
         if isinstance(index_names, str):
             index_names = index_names.split(",")
         assert isinstance(index_names, list) and len(index_names) > 0
         assert "_id" not in condition
 
+        # 模块1：构建过滤条件（Bool Query）
         bool_query = Q("bool", must=[])
-        condition["kb_id"] = knowledgebase_ids
+        condition["kb_id"] = knowledgebase_ids # 强制数据隔离
         for k, v in condition.items():
             if k == "available_int":
+                # 特殊处理可用状态
                 if v == 0:
                     bool_query.filter.append(Q("range", available_int={"lt": 1}))
                 else:
@@ -174,6 +224,7 @@ class ESConnection(ESConnectionBase):
                         Q("bool", must_not=Q("range", available_int={"lt": 1})))
                 continue
             if k == "id":
+                # 支持同时查询id和_id字段
                 if not v:
                     continue
                 if isinstance(v, list):
@@ -185,6 +236,7 @@ class ESConnection(ESConnectionBase):
                 continue
             if not v:
                 continue
+            # 普通字段条件
             if isinstance(v, list):
                 bool_query.filter.append(Q("terms", **{k: v}))
             elif isinstance(v, str) or isinstance(v, int):
@@ -195,7 +247,9 @@ class ESConnection(ESConnectionBase):
 
         s = Search()
         vector_similarity_weight = 0.5
+        # 模块3：混合搜索权重计算 : 实现文本和向量的加权混合搜索。
         for m in match_expressions:
+            # 从FusionExpr中提取权重
             if isinstance(m, FusionExpr) and m.method == "weighted_sum" and "weights" in m.fusion_params:
                 assert len(match_expressions) == 3 and isinstance(match_expressions[0], MatchTextExpr) and isinstance(
                     match_expressions[1],
@@ -203,6 +257,7 @@ class ESConnection(ESConnectionBase):
                     match_expressions[2], FusionExpr)
                 weights = m.fusion_params["weights"]
                 vector_similarity_weight = get_float(weights.split(",")[1])
+        # 模块2：处理匹配表达式
         for m in match_expressions:
             if isinstance(m, MatchTextExpr):
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
@@ -212,16 +267,18 @@ class ESConnection(ESConnectionBase):
                                          type="best_fields", query=m.matching_text,
                                          minimum_should_match=minimum_should_match,
                                          boost=1))
+                # 文本查询的boost设置为(1 - 向量权重)
                 bool_query.boost = 1.0 - vector_similarity_weight
 
+            # 向量匹配（MatchDenseExpr）
             elif isinstance(m, MatchDenseExpr):
                 assert (bool_query is not None)
                 similarity = 0.0
                 if "similarity" in m.extra_options:
                     similarity = m.extra_options["similarity"]
-                s = s.knn(m.vector_column_name,
-                          m.topn,
-                          m.topn * 2,
+                s = s.knn(m.vector_column_name,     # 向量字段名
+                          m.topn,                   # 返回数量
+                          m.topn * 2,               # 候选数量
                           query_vector=list(m.embedding_data),
                           filter=bool_query.to_dict(),
                           similarity=similarity,
@@ -240,6 +297,7 @@ class ESConnection(ESConnectionBase):
 
         if order_by:
             orders = list()
+            # 模块4：排序和分页
             for field, order in order_by.fields:
                 order = "asc" if order == 0 else "desc"
                 if field in ["page_num_int", "top_int"]:
@@ -259,11 +317,12 @@ class ESConnection(ESConnectionBase):
 
         has_dense = any(isinstance(m, MatchDenseExpr) for m in match_expressions)
         has_explicit_sort = bool(order_by and order_by.fields)
+        # 判断是否使用search_after
         use_search_after = (
             limit > 0
-            and (offset + limit > MAX_RESULT_WINDOW)
-            and has_explicit_sort
-            and not has_dense
+            and (offset + limit > MAX_RESULT_WINDOW)        # 超过深度限制
+            and has_explicit_sort                           # 有明确排序
+            and not has_dense                               # 不是向量搜索
         )
 
         if limit > 0 and not use_search_after:
@@ -277,9 +336,10 @@ class ESConnection(ESConnectionBase):
         # ES 9.x: dense_vector fields excluded from _source; request them via fields.
         # Note: knn does NOT have a "fields" parameter - adding it inside the knn
         # object causes BadRequestError on ES 9.x. We add "fields" at top level.
+        # 模块5：向量字段处理（ES 9.x兼容）
         vector_fields = [f for f in (select_fields or []) if f.endswith("_vec")]
         if vector_fields:
-            q["fields"] = vector_fields
+            q["fields"] = vector_fields     # dense_vector字段需要从fields获取
         self.logger.debug(f"ESConnection.search {str(index_names)} query: " + json.dumps(q))
 
         for i in range(ATTEMPT_TIME):
@@ -309,13 +369,28 @@ class ESConnection(ESConnectionBase):
         raise Exception("ESConnection.search timeout.")
 
     def insert(self, documents: list[dict], index_name: str, knowledgebase_id: str = None) -> list[str]:
+        """
+        Elasticsearch批量插入操作的实现，用于向ES索引中批量添加文档
+        :param documents:           要插入的文档列表（字典格式）
+        :param index_name:          ES索引名称
+        :param knowledgebase_id:    知识库ID（可选，用于数据隔离）
+        :return:                    错误列表（空列表表示全部成功）
+        """
         # Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
+        # 构建批量操作（Bulk Operations）
+        # # operations列表格式：[操作元数据, 文档数据, 操作元数据, 文档数据, ...]
+        # [
+        #     {"index": {"_index": "my_index", "_id": "chunk1"}},
+        #     {"id": "chunk1", "content": "text", "kb_id": "kb123"},
+        #     {"index": {"_index": "my_index", "_id": "chunk2"}},
+        #     {"id": "chunk2", "content": "text2", "kb_id": "kb123"}
+        # ]
         operations = []
         for d in documents:
-            assert "_id" not in d
-            assert "id" in d
-            d_copy = copy.deepcopy(d)
-            d_copy["kb_id"] = knowledgebase_id
+            assert "_id" not in d   # 不允许使用ES内部_id
+            assert "id" in d        # 必须有业务ID
+            d_copy = copy.deepcopy(d) #  深拷贝避免修改原数据
+            d_copy["kb_id"] = knowledgebase_id # 添加租户隔离字段
             # Use id as _id for uniqueness, also keep "id" as a regular field for sorting
             meta_id = d_copy.get("id", "")
             operations.append(
@@ -326,16 +401,30 @@ class ESConnection(ESConnectionBase):
         for _ in range(ATTEMPT_TIME):
             try:
                 res = []
+                # 执行批量插入（带重试）
+                # 1.refresh="wait_for"：等待索引刷新后再返回，确保数据立即可查
+                # 2.timeout="60s"：操作超时时间
+                #
+                # 批量操作优势
+                # 性能提升：一次网络请求插入多条数据
+                # 原子性：部分失败不影响其他文档
+                # 错误明细：能精确定位失败的文档
                 r = self.es.bulk(index=index_name, operations=operations,
                                  refresh="wait_for", timeout="60s")
+                # 错误处理 : 检查整体状态
                 if re.search(r"False", str(r["errors"]), re.IGNORECASE):
-                    return res
+                    return res # 无错误，返回空列表
 
+                # 提取详细错误
+                # 1.遍历每个操作的结果
+                # 2.检查是否包含错误信息
+                # 3.返回格式："文档ID:错误信息"
                 for item in r["items"]:
                     for action in ["create", "delete", "index", "update"]:
                         if action in item and "error" in item[action]:
                             res.append(str(item[action]["_id"]) + ":" + str(item[action]["error"]))
                 return res
+            # 异常处理
             except ConnectionTimeout:
                 self.logger.exception("ES request timeout")
                 time.sleep(3)
@@ -348,17 +437,60 @@ class ESConnection(ESConnectionBase):
         return res
 
     def update(self, condition: dict, new_value: dict, index_name: str, knowledgebase_id: str) -> bool:
+        """
+        Elasticsearch更新操作的底层实现，支持单文档更新和批量更新
+        1. 更新字段（Update）
+        new_value = {
+            "content_with_weight": "新内容",
+            "available_int": 1
+        }
+        生成脚本：ctx._source.content_with_weight=params.pp_content_with_weight;ctx._source.available_int=1;
+
+        2. 删除字段（Remove）
+        new_value = {
+            "remove": "old_field"  # 或 ["field1", "field2"]
+        }
+        生成脚本：ctx._source.remove('old_field');
+
+        3. 删除数组元素（Remove from array）
+        python
+        new_value = {
+            "remove": {"tag_kwd": "旧标签"}  # 从标签数组中移除特定标签
+        }
+        生成脚本：
+        int i=ctx._source.tag_kwd.indexOf(params.p_tag_kwd);
+        ctx._source.tag_kwd.remove(i);
+
+        4. 添加数组元素（Add to array）
+        new_value = {
+            "add": {"tag_kwd": "新标签"}
+        }
+        生成脚本：ctx._source.tag_kwd.add(params.pp_tag_kwd);
+
+        :param condition:           查询条件（指定要更新的文档）
+        :param new_value:           要更新的字段和值
+        :param index_name:          ES索引名
+        :param knowledgebase_id:    知识库ID（数据隔离）
+        :return:                    成功/失败
+        """
         doc = copy.deepcopy(new_value)
         doc.pop("id", None)
         condition["kb_id"] = knowledgebase_id
+        # 模式一：单文档更新（精确更新）
         if "id" in condition and isinstance(condition["id"], str):
             # update specific single document
+            # 通过ID精确更新单个文档
             chunk_id = condition["id"]
             for i in range(ATTEMPT_TIME):
                 doc_part = copy.deepcopy(doc)
+                # 步骤2：处理删除操作（remove）
                 remove_value = doc_part.pop("remove", None)
                 remove_field = remove_value if isinstance(remove_value, str) else None
                 remove_dict = remove_value if isinstance(remove_value, dict) else None
+                # 步骤1：处理特殊字段（feas字段）
+                # 遍历所有字段
+                # 识别以_feas结尾的字段（特征字段）
+                # 先执行删除操作（如果存在）
                 for k in doc_part.keys():
                     if "feas" != k.split("_")[-1]:
                         continue
@@ -369,12 +501,14 @@ class ESConnection(ESConnectionBase):
                             f"ESConnection.update(index={index_name}, id={chunk_id}, doc={json.dumps(condition, ensure_ascii=False)}) got exception")
                 try:
                     if remove_field is not None:
+                        # 删除单个字段
                         self.es.update(
                             index=index_name,
                             id=chunk_id,
                             script=f"ctx._source.remove('{remove_field}');",
                         )
                     if remove_dict is not None:
+                        # 从数组中删除特定元素
                         scripts = []
                         params = {}
                         for kk, vv in remove_dict.items():
@@ -390,6 +524,9 @@ class ESConnection(ESConnectionBase):
                                 id=chunk_id,
                                 script={"source": "".join(scripts), "params": params},
                             )
+                    #  执行文档更新
+                    # 使用ES的doc参数进行部分更新
+                    # 只更新提供的字段
                     if doc_part:
                         self.es.update(index=index_name, id=chunk_id, doc=doc_part)
                     if remove_field is not None or remove_dict is not None or doc_part:
@@ -402,6 +539,11 @@ class ESConnection(ESConnectionBase):
             return False
 
         # update unspecific maybe-multiple documents
+        # 模式二：批量更新流程
+        # 步骤1：构建查询条件
+        # 支持terms查询（列表匹配）
+        # 支持term查询（精确匹配）
+        # 支持exists查询（字段存在）
         bool_query = Q("bool")
         for k, v in condition.items():
             if not isinstance(k, str) or not v:
@@ -416,10 +558,12 @@ class ESConnection(ESConnectionBase):
             else:
                 raise Exception(
                     f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
+        # 步骤2：构建更新脚本
         scripts = []
         params = {}
         for k, v in new_value.items():
             if k == "remove":
+                # 删除字段或数组元素
                 if isinstance(v, str):
                     scripts.append(f"ctx._source.remove('{v}');")
                 if isinstance(v, dict):
@@ -428,6 +572,7 @@ class ESConnection(ESConnectionBase):
                         params[f"p_{kk}"] = vv
                 continue
             if k == "add":
+                # 向数组添加元素
                 if isinstance(v, dict):
                     for kk, vv in v.items():
                         scripts.append(f"ctx._source.{kk}.add(params.pp_{kk});")
@@ -435,8 +580,9 @@ class ESConnection(ESConnectionBase):
                 continue
             if (not isinstance(k, str) or not v) and k != "available_int":
                 continue
+            # 普通字段更新
             if isinstance(v, str):
-                v = re.sub(r"(['\n\r]|\\.)", " ", v)
+                v = re.sub(r"(['\n\r]|\\.)", " ", v) # 清理特殊字符
                 params[f"pp_{k}"] = v
                 scripts.append(f"ctx._source.{k}=params.pp_{k};")
             elif isinstance(v, int) or isinstance(v, float):
@@ -447,13 +593,14 @@ class ESConnection(ESConnectionBase):
             else:
                 raise Exception(
                     f"newValue `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str.")
+        # 步骤3：执行批量更新
         ubq = UpdateByQuery(
             index=index_name).using(
             self.es).query(bool_query)
         ubq = ubq.script(source="".join(scripts), params=params)
         ubq = ubq.params(refresh=True)
-        ubq = ubq.params(slices=5)
-        ubq = ubq.params(conflicts="proceed")
+        ubq = ubq.params(slices=5) # 并行分片
+        ubq = ubq.params(conflicts="proceed") # 冲突时继续
 
         for _ in range(ATTEMPT_TIME):
             try:
@@ -525,13 +672,30 @@ class ESConnection(ESConnectionBase):
         return False
 
     def delete(self, condition: dict, index_name: str, knowledgebase_id: str) -> int:
+        """
+        Elasticsearch删除操作的实现，属于数据存储层的方法
+        :param condition:           删除条件字典
+        :param index_name:          ES索引名称
+        :param knowledgebase_id:    知识库ID（用于数据隔离）
+        :return:                    删除的文档数量（int）
+        """
+        # 条件预处理
+        # 断言：不允许直接使用_id（ES内部ID）
         assert "_id" not in condition
+        # 强制添加kb_id条件，确保数据隔离（多租户安全）
         condition["kb_id"] = knowledgebase_id
 
         # Build a bool query that combines id filter with other conditions
+        # 构建布尔查询（Bool Query）
+        # 1.使用Elasticsearch的Bool Query组合多个条件
+        # 2.包含：filter（过滤）、must（必须匹配）、must_not（必须不匹配）
         bool_query = Q("bool")
 
         # Handle chunk IDs if present
+        # 处理块ID（特殊逻辑）
+        # 1.id字段：业务ID（不是ES的_id）
+        # 2.使用ids查询进行精确匹配
+        # 3.如果是空列表，不添加此条件（相当于忽略）
         if "id" in condition:
             chunk_ids = condition["id"]
             if not isinstance(chunk_ids, list):
@@ -542,6 +706,13 @@ class ESConnection(ESConnectionBase):
             # If chunk_ids is empty, we don't add an ids filter - rely on other conditions
 
         # Add all other conditions as filters
+        # 处理其他条件
+        # 支持的条件类型：
+        # 条件类型	说明	        ES查询类型
+        # exists	字段存在	    exists query
+        # must_not	否定条件	    must_not 子句
+        # list	    多值匹配	    terms query
+        # str/int	精确匹配	    term query
         for k, v in condition.items():
             if k == "id":
                 continue  # Already handled above
@@ -560,11 +731,23 @@ class ESConnection(ESConnectionBase):
                 raise Exception("Condition value must be int, str or list.")
 
         # If no filters were added, use match_all (for tenant-wide operations)
+        # 查询构建
+        # 1.如果没有条件，使用match_all（删除所有文档）
+        # 2.否则使用构建的bool查询
         if not bool_query.filter and not bool_query.must and not bool_query.must_not:
             qry = Q("match_all")
         else:
             qry = bool_query
         self.logger.debug("ESConnection.delete query: " + json.dumps(qry.to_dict()))
+        # 执行删除（带重试机制）
+        # 重试机制：
+        # 连接超时：等待3秒后重连，继续重试
+        # 索引不存在：返回0（幂等性）
+        # 其他异常：记录日志后返回0
+        #
+        # 性能优化
+        # 使用refresh=True：删除后立即刷新，保证一致性
+        # 使用delete_by_query：批量删除，比逐条删除高效
         for _ in range(ATTEMPT_TIME):
             try:
                 res = self.es.delete_by_query(
