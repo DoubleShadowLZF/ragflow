@@ -357,26 +357,39 @@ async def _run_workflow_session(
 
 
 @manager.route("/agents/<agent_id>/sessions", methods=["GET"])  # noqa: F821
-@login_required
-@add_tenant_id_to_kwargs
-@_require_canvas_access_sync
+@login_required # 要求用户登录
+@add_tenant_id_to_kwargs    # 自动注入租户 ID
+@_require_canvas_access_sync    # 同步校验用户对 Agent 的访问权限
 def list_agent_sessions(agent_id, tenant_id):
-    session_id = request.args.get("id")
-    user_id = request.args.get("user_id")
-    page_number = int(request.args.get("page", 1))
-    items_per_page = validate_rest_api_page_size(int(request.args.get("page_size", 30)))
-    keywords = request.args.get("keywords")
-    from_date = request.args.get("from_date")
-    to_date = request.args.get("to_date")
-    orderby = request.args.get("orderby", "update_time")
-    exp_user_id = request.args.get("exp_user_id")
-    desc = request.args.get("desc") not in {"False", "false"}
+    """
+    获取指定 Agent 下的所有会话记录，支持多种过滤条件、分页和排序。
+    :param agent_id:
+    :param tenant_id:
+    :return:
+    """
+    session_id = request.args.get("id")                         # 精确查询会话ID
+    user_id = request.args.get("user_id")                       # 按用户过滤
+    page_number = int(request.args.get("page", 1))              # 页码（默认1）
+    items_per_page = validate_rest_api_page_size(               # 每页数量（默认30）
+        int(request.args.get("page_size", 30))
+    )
+    keywords = request.args.get("keywords")                     # 关键词搜索
+    from_date = request.args.get("from_date")                   # 开始日期
+    to_date = request.args.get("to_date")                       # 结束日期
+    orderby = request.args.get("orderby", "update_time")        # 排序字段（默认更新时间）
+    exp_user_id = request.args.get("exp_user_id")               # 实验用户ID
+    desc = request.args.get("desc") not in {"False", "false"}   # 是否降序
 
+    # 实验用户模式（快速返回）
+    # 实验用户：只返回会话名称列表（不含完整内容）
+    # 优化目的：A/B 测试场景下快速获取会话概览
+    # 不进行分页：直接返回所有匹配会话
     if exp_user_id:
         sessions = API4ConversationService.get_names(agent_id, exp_user_id)
         return _agent_session_list_result(sessions, len(sessions))
 
-    include_dsl = request.args.get("dsl") not in {"False", "false"}
+    include_dsl = request.args.get("dsl") not in {"False", "false"}  # 是否包含DSL
+    # 正常查询模式
     total, sessions = API4ConversationService.get_list(
         agent_id,
         tenant_id,
@@ -392,6 +405,9 @@ def list_agent_sessions(agent_id, tenant_id):
         to_date,
         exp_user_id=exp_user_id,
     )
+    # 数据规范化
+    # _normalize_agent_session：字段映射和格式转换
+    # _agent_session_list_result：统一响应格式
     sessions = [_normalize_agent_session(session) for session in sessions]
     return _agent_session_list_result(sessions, total)
 
@@ -401,12 +417,26 @@ def list_agent_sessions(agent_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_async
 async def create_agent_session(agent_id, tenant_id):
+    """
+    核心功能:为一个 Agent（智能体）创建一个新的会话实例，包括初始化对话状态、设置 DSL（领域特定语言）、记录会话元数据等。
+    """
     from agent.canvas import Canvas
 
+    # 参数解析
     req = await get_request_json()
-    user_id = req.get("user_id") or request.args.get("user_id", tenant_id)
-    release_mode = bool(req.get("release", request.args.get("release", False)))
+    user_id = req.get("user_id") or request.args.get("user_id", tenant_id)      # 会话所属用户（默认使用租户 ID）
+    release_mode = bool(req.get("release", request.args.get("release", False))) #是否使用已发布的 Agent 版本
 
+    # 获取 Agent DSL
+    #
+    # get_agent_dsl_with_release 的作用：
+    # 参数	                说明
+    # release_mode=False	获取草稿版本（最新编辑的内容）
+    # release_mode=True	    获取已发布的稳定版本
+    #
+    # 返回值：
+    # cvs：Canvas 对象（包含 Agent 元信息）
+    # dsl：DSL 配置（定义 Agent 的行为逻辑）
     try:
         cvs, dsl = UserCanvasService.get_agent_dsl_with_release(agent_id, release_mode, tenant_id)
     except LookupError:
@@ -414,12 +444,31 @@ async def create_agent_session(agent_id, tenant_id):
     except PermissionError as e:
         return get_data_error_result(message=str(e))
 
+    # 初始化 Canvas
+    # 1.生成新的会话 ID
+    # 2.创建 Canvas 实例并重置状态（清空对话历史）
+    # 3.将 Canvas 对象序列化为 JSON DSL
     session_id = get_uuid()
     canvas = Canvas(dsl, tenant_id, agent_id, canvas_id=cvs.id)
     canvas.reset()
 
     cvs.dsl = json.loads(str(canvas))
+    # 获取版本标题
+    # 1.记录当前使用的 Agent 版本标题
+    # 2.便于后续追溯和版本管理
     version_title = UserCanvasVersionService.get_latest_version_title(cvs.id, release_mode=release_mode)
+    # 建会话对象
+    #
+    # 字段说明：
+    # 字段	        值           	说明
+    # id	        新生成的 UUID	会话唯一标识
+    # name	        用户传入或空 	    会话名称
+    # dialog_id	    Canvas ID	    关联的 Agent
+    # user_id	    用户 ID	        会话所有者
+    # message	    Agent 开场白	    初始助手指令
+    # source	    "agent"     	标记为 Agent 来源
+    # dsl	        Canvas DSL	    保存当前 Agent 配置快照
+    # version_title	版本标题	        记录使用的版本
     conv = {
         "id": session_id,
         "name": req.get("name", ""),
@@ -441,6 +490,9 @@ async def create_agent_session(agent_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_sync
 def get_agent_session(agent_id, session_id, tenant_id):
+    """
+    根据 Agent ID 和会话 ID，用于获取指定 Agent 下某个会话的完整详情。它支持开发者或前端应用获取一个已存在的 Agent 会话的所有信息，包括对话历史、引用来源和执行元数据。
+    """
     exists, conv = API4ConversationService.get_by_id(session_id)
     if not exists:
         return get_data_error_result(message="Session not found!")
@@ -452,6 +504,9 @@ def get_agent_session(agent_id, session_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_sync
 def delete_agent_session_item(agent_id, session_id, tenant_id):
+    """
+    根据 Agent ID 和会话 ID，删除指定的会话记录。
+    """
     return get_json_result(data=API4ConversationService.delete_by_id(session_id))
 
 
@@ -460,9 +515,18 @@ def delete_agent_session_item(agent_id, session_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_async
 async def delete_agent_session(tenant_id, agent_id):
+    """
+    用于批量删除指定 Agent 下的多个会话。它支持按 ID 列表删除或一键删除所有会话，并返回详细的执行结果。
+    """
+    # 变量初始化
+    # 收集删除失败的错误信息
     errors = []
+    # 统计成功删除的数量
     success_count = 0
     req = await get_request_json()
+    # Agent 存在性校验
+    # 1.验证用户是否拥有该 Agent
+    # 2.防止越权操作
     cvs = await thread_pool_exec(UserCanvasService.query, user_id=tenant_id, id=agent_id)
     if not cvs:
         return get_error_data_result(f"You don't own the agent {agent_id}")
@@ -470,6 +534,13 @@ async def delete_agent_session(tenant_id, agent_id):
     if not req:
         return get_result()
 
+    # 解析删除目标
+    # 删除模式：
+    #
+    # 模式	    触发条件	            行为
+    # 指定 ID	ids 存在	            删除列表中指定的会话
+    # 删除全部	delete_all == True	删除 Agent 下所有会话
+    # 无操作	    两者都不满足	        直接返回成功
     ids = req.get("ids")
     if not ids:
         if req.get("delete_all") is True:
@@ -479,19 +550,34 @@ async def delete_agent_session(tenant_id, agent_id):
         else:
             return get_result()
 
+    # ID 去重
+    # 1.去除重复的会话 ID
+    # 2.记录重复 ID 的错误信息
     conv_list = ids
 
     unique_conv_ids, duplicate_messages = check_duplicate_ids(conv_list, "session")
     conv_list = unique_conv_ids
 
+    # 批量删除执行
     for session_id in conv_list:
+        # 查询会话是否存在且属于该 Agent
         conv = await thread_pool_exec(API4ConversationService.query, id=session_id, dialog_id=agent_id)
+        # 如果不满足条件，记录错误
         if not conv:
             errors.append(f"The agent doesn't own the session {session_id}")
             continue
+        # 如果满足条件，执行删除
         await thread_pool_exec(API4ConversationService.delete_by_id, session_id)
+        # 成功计数 +1
         success_count += 1
 
+    # 结果返回
+    # 返回逻辑：
+    #
+    # 情况	    响应类型	                    说明
+    # 全部成功	get_result()	            无错误信息
+    # 部分成功	get_result()	            包含成功数和错误列表
+    # 全部失败	get_error_data_result()	    返回错误信息
     if errors:
         if success_count > 0:
             return get_result(data={"success_count": success_count, "errors": errors},
@@ -514,6 +600,9 @@ async def delete_agent_session(tenant_id, agent_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def download_agent_file(tenant_id):
+    """
+    根据文件 ID 从对象存储中获取文件内容，并以二进制流的形式返回给客户端。
+    """
     id = request.args.get("id")
     logging.info("Agent file download requested: tenant_id=%s file_id=%s", tenant_id, id)
     blob = await thread_pool_exec(FileService.get_blob, tenant_id, id)
@@ -553,12 +642,18 @@ async def _iter_session_completion_events(tenant_id, agent_id, req, return_trace
 @manager.route("/agents/templates", methods=["GET"])  # noqa: F821
 @login_required
 def list_agent_template():
+    """
+    获取所有 Agent 模板的列表，返回模板的名称、描述、配置等信息。
+    """
     return get_json_result(data=[item.to_dict() for item in CanvasTemplateService.get_all()])
 
 
 @manager.route("/agents/prompts", methods=["GET"])  # noqa: F821
 @login_required
 def prompts():
+    """
+    返回 Agent 工作流中各个阶段使用的系统级提示词模板，供前端调试或展示。
+    """
     from rag.prompts.generator import (
         ANALYZE_TASK_SYSTEM,
         ANALYZE_TASK_USER,
@@ -581,19 +676,29 @@ def prompts():
 @login_required
 @add_tenant_id_to_kwargs
 def list_agents(tenant_id):
-    keywords = request.args.get("keywords", "")
-    canvas_category = request.args.get("canvas_category")
-    owner_ids = [item for item in request.args.get("owner_ids", "").strip().split(",") if item]
-    tags = [item for item in request.args.get("tags", "").strip().split(",") if item]
+    """
+    返回用户可访问的 Agent 列表，支持按关键词、所有者、标签、分类过滤，并支持分页和排序。
+    :param tenant_id:
+    :return:
+    """
+    keywords = request.args.get("keywords", "")  # 关键词搜索
+    canvas_category = request.args.get("canvas_category")  # Agent分类
+    owner_ids = [item for item in request.args.get("owner_ids", "").strip().split(",") if item]  # 所有者过滤
+    tags = [item for item in request.args.get("tags", "").strip().split(",") if item]  # 标签过滤
 
-    page_number = int(request.args.get("page", 0))
-    items_per_page = validate_rest_api_page_size(int(request.args.get("page_size", 0)))
-    order_by = request.args.get("orderby", "create_time")
-    desc = str(request.args.get("desc", "true")).lower() != "false"
+    page_number = int(request.args.get("page", 0))  # 页码（从0开始）
+    items_per_page = validate_rest_api_page_size(int(request.args.get("page_size", 0)))  # 每页数量
+    order_by = request.args.get("orderby", "create_time")  # 排序字段
+    desc = str(request.args.get("desc", "true")).lower() != "false"  # 是否降序
+    # 权限与所有者过滤
+    # 1.获取用户加入的所有租户（团队）
+    # 2.加上用户自己的租户 ID
+    # 3.构建授权所有者集合
     tenants = TenantService.get_joined_tenants_by_user_id(tenant_id)
     authorized_owner_ids = {member["tenant_id"] for member in tenants}
     authorized_owner_ids.add(tenant_id)
 
+    # 所有者过滤校验：防止越权访问
     if owner_ids:
         requested_owner_ids = set(owner_ids)
         unauthorized_owner_ids = requested_owner_ids - authorized_owner_ids
@@ -607,6 +712,9 @@ def list_agents(tenant_id):
     else:
         effective_owner_ids = list(authorized_owner_ids)
 
+    # 查询 Agent 列表
+    # canvas：Agent 列表数据
+    # total：匹配的总记录数（用于分页）
     canvas, total = UserCanvasService.get_by_tenant_ids(
         effective_owner_ids,
         tenant_id,
@@ -644,6 +752,12 @@ def list_agent_tags(tenant_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def update_agent_tags(tenant_id, canvas_id):
+    """
+    更新指定 Agent 的标签列表，支持批量标签管理。
+    """
+    # 权限校验
+    # 检查用户是否有权访问该 Agent
+    # 无权限时记录日志并返回错误
     if not UserCanvasService.accessible(canvas_id, tenant_id):
         logging.info(
             "update_agent_tags denied tenant=%s canvas_id=%s reason=no_permission",
@@ -655,10 +769,23 @@ async def update_agent_tags(tenant_id, canvas_id):
             message="Agent not found or no permission.",
             code=RetCode.OPERATING_ERROR,
         )
+    # 参数解析与规范化
+    # 支持两种输入格式：
+    #
+    # 格式	    示例	                处理方式
+    # 列表	    ["生产", "客服"]	    直接使用
+    # 字符串	    "生产,客服"	        按逗号分割
     req = await get_request_json()
     tags = req.get("tags", "")
     incoming = tags if isinstance(tags, (list, tuple)) else [t for t in str(tags).split(",") if t.strip()]
+    # 执行更新
     rows_affected = UserCanvasService.update_tags(canvas_id, tags)
+    # 结果校验与日志
+    # 返回逻辑：
+    #
+    # 情况	                响应	        说明
+    # rows_affected > 0	    data=True	更新成功
+    # rows_affected == 0	data=False	未找到或无权更新
     if rows_affected == 0:
         logging.info(
             "update_agent_tags miss tenant=%s canvas_id=%s incoming_count=%d rows=0",
@@ -685,12 +812,23 @@ async def update_agent_tags(tenant_id, canvas_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def create_agent(tenant_id):
+    """
+    创建一个新的 Agent，包括保存 DSL 配置、创建版本记录、同步到 Replica 系统，并返回创建的 Agent 信息。
+    """
+    # 过滤掉 None 值（避免覆盖默认值）
     req = {k: v for k, v in (await get_request_json()).items() if v is not None}
     req["canvas_type"] = req.get("canvas_type","")
+    # 设置 user_id 为当前租户 ID
     req["user_id"] = tenant_id
+    # 默认 canvas_category 为 Agent
     req["canvas_category"] = req.get("canvas_category") or CanvasCategory.Agent
+    # release 转为布尔值
     req["release"] = bool(req.get("release", ""))
 
+    # DSL 校验与规范化
+    # 1.确保 dsl 存在
+    # 2.规范化 DSL 格式（确保节点、边、工具等结构正确）
+    # 3.校验失败时返回具体错误
     if req.get("dsl") is None:
         return get_json_result(
             data=False,
@@ -707,6 +845,9 @@ async def create_agent(tenant_id):
             code=RetCode.ARGUMENT_ERROR,
         )
 
+    # 标题校验与去重
+    # 1.标题不能为空
+    # 2.同一租户下不能有同名 Agent
     if req.get("title") is None:
         return get_json_result(
             data=False,
@@ -722,10 +863,17 @@ async def create_agent(tenant_id):
     ):
         return get_data_error_result(message=f"{req['title']} already exists.")
 
+    # 保存 Agent
+    # 1.生成唯一 ID
+    # 2.保存到数据库
     req["id"] = get_uuid()
     if not UserCanvasService.save(**req):
         return get_data_error_result(message="Fail to create agent.")
 
+    # 创建版本快照
+    # 1.获取所有者昵称
+    # 2.构建版本标题：{昵称} - {Agent名称}
+    # 3.保存最新版本快照
     owner_nickname = _get_user_nickname(tenant_id)
     UserCanvasVersionService.save_or_replace_latest(
         user_canvas_id=req["id"],
@@ -733,6 +881,9 @@ async def create_agent(tenant_id):
         dsl=req["dsl"],
         release=req.get("release"),
     )
+    # 同步到 Replica 系统
+    # 1.将 Agent 同步到 Replica 系统（用于分布式执行）
+    # 2.同步失败时返回错误（但 Agent 已保存）
     replica_ok = CanvasReplicaService.replace_for_set(
         canvas_id=req["id"],
         tenant_id=str(tenant_id),
@@ -744,6 +895,9 @@ async def create_agent(tenant_id):
     if not replica_ok:
         return get_data_error_result(message="canvas saved, but replica sync failed.")
 
+    # 查询并返回创建的 Agent
+    # 1.从数据库查询刚创建的 Agent
+    # 2.返回完整的 Agent 信息
     exists, created_agent = UserCanvasService.get_by_canvas_id(req["id"])
     if not exists:
         return get_data_error_result(message="Fail to create agent.")
@@ -755,8 +909,18 @@ async def create_agent(tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_async
 async def upload_agent_file(agent_id, tenant_id):
+    """
+    为指定的 Agent 上传一个或多个文件，支持通过 URL 抓取文件，并返回文件的元数据信息。
+    """
+    # 解析上传的文件
+    # 1.从请求中获取文件列表
+    # 2.支持 file 字段的多个文件上传
+    # 3.如果没有文件，返回空列表
     files = await request.files
     file_objs = files.getlist("file") if files and files.get("file") else []
+    # 日志记录
+    # 1.记录上传请求的关键信息
+    # 2.便于审计和问题排查
     logging.info(
         "Agent file upload requested: tenant_id=%s agent_id=%s file_count=%s",
         tenant_id,
@@ -764,15 +928,24 @@ async def upload_agent_file(agent_id, tenant_id):
         len(file_objs),
     )
     try:
+        # 文件上传处理
+        # 1.单文件使用 thread_pool_exec 执行
+        # 2.支持通过 url 参数抓取远程文件
         if len(file_objs) == 1:
             uploaded = await thread_pool_exec(
                 FileService.upload_info, tenant_id, file_objs[0], request.args.get("url")
             )
             return get_json_result(data=uploaded)
+        # 多文件上传
+        # 1.多文件使用 asyncio.gather 并发上传
+        # 2.每个文件独立处理，互不影响
         results = await asyncio.gather(
             *(thread_pool_exec(FileService.upload_info, tenant_id, file_obj) for file_obj in file_objs)
         )
         return get_json_result(data=results)
+    # 错误处理
+    # 1.捕获所有异常并记录
+    # 2.返回服务器错误响应
     except Exception as exc:
         logging.exception(
             "Agent file upload failed: tenant_id=%s agent_id=%s",
@@ -805,26 +978,47 @@ def get_agent_component_input_form(agent_id, component_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_async
 async def debug_agent_component(agent_id, component_id, tenant_id):
+    """
+    在调试模式下执行 Agent 工作流中的指定组件，注入测试参数，并返回组件的执行结果。
+    """
     req = await get_request_json()
     try:
         from agent.canvas import Canvas
         from agent.component import LLM
 
+        # 获取 Agent 配置
+        # 从数据库获取 Agent 的 DSL 配置
         _, user_canvas = UserCanvasService.get_by_id(agent_id)
+        # 创建 Canvas 实例并重置状态
         canvas = Canvas(json.dumps(user_canvas.dsl), tenant_id, canvas_id=user_canvas.id)
         canvas.reset()
+        # 生成新的消息 ID（用于追踪）
         canvas.message_id = get_uuid()
+        # 获取目标组件
+        # 1.根据组件 ID 从 Canvas 中获取组件对象
+        # 2.重置组件状态（清空缓存等）
         component = canvas.get_component(component_id)["obj"]
         component.reset()
 
+        # 注入测试参数
+        # 1.如果是 LLM 组件，调用 set_debug_inputs 设置调试输入
+        # 2.调用组件的 invoke 方法，传入参数
         if isinstance(component, LLM):
             component.set_debug_inputs(req["params"])
+        # 参数结构化
         component.invoke(**{k: o["value"] for k, o in req["params"].items()})
+        # 异步输出处理
+        # 1.获取组件输出
+        # 2.如果输出是 partial 类型（流式输出）：
+        # 1).检测是异步生成器还是同步生成器
+        # 2).遍历并拼接所有输出片段
+        # 3.将流式输出合并为完整字符串
         outputs = component.output()
         for k in outputs.keys():
             if isinstance(outputs[k], partial):
                 txt = ""
                 iter_obj = outputs[k]()
+                # 流式输出支持
                 if inspect.isasyncgen(iter_obj):
                     async for c in iter_obj:
                         txt += c
@@ -832,6 +1026,7 @@ async def debug_agent_component(agent_id, component_id, tenant_id):
                     for c in iter_obj:
                         txt += c
                 outputs[k] = txt
+        # 返回结果
         return get_json_result(data=outputs)
     except Exception as exc:
         return server_error_response(exc)
@@ -841,14 +1036,27 @@ async def debug_agent_component(agent_id, component_id, tenant_id):
 @login_required
 @add_tenant_id_to_kwargs
 def get_agent(agent_id, tenant_id):
+    """
+    获取指定 Agent 的完整信息，包括 DSL 配置、发布时间、关联数据集等，并确保 Replica 系统同步。
+    """
+    # 权限校验
+    # 1.检查用户是否有权访问该 Agent
+    # 2.无权访问时返回 404 错误
     if not UserCanvasService.accessible(agent_id, tenant_id):
         return get_data_error_result(message="canvas not found.")
 
+    # 获取 Agent 数据
+    # 1.从数据库查询 Agent 信息
+    # 2.不存在时返回 404 错误
     exists, canvas = UserCanvasService.get_by_canvas_id(agent_id)
     if not exists:
         return get_data_error_result(message="canvas not found.")
 
     try:
+        # Replica 系统同步
+        # 1.确保 Replica 系统中有该 Agent 的配置
+        # 2.用于分布式执行环境
+        # 3.同步失败时返回错误
         CanvasReplicaService.bootstrap(
             canvas_id=agent_id,
             tenant_id=str(tenant_id),
@@ -860,6 +1068,11 @@ def get_agent(agent_id, tenant_id):
     except ValueError as exc:
         return get_data_error_result(message=str(exc))
 
+    # 计算发布时间
+    # 1.获取 Agent 的所有版本
+    # 2.筛选已发布的版本（release=True）
+    # 3.按更新时间降序排列
+    # 4.取最新发布版本的时间
     last_publish_time = None
     versions = UserCanvasVersionService.list_by_canvas_id(agent_id)
     if versions:
@@ -869,10 +1082,18 @@ def get_agent(agent_id, tenant_id):
             last_publish_time = released_versions[0].update_time
 
     from agent.dsl_migration import normalize_chunker_dsl
-
+    # DSL 迁移
+    # 1.对 DSL 进行规范化/迁移
+    # 2.确保 DSL 格式与当前版本兼容
+    # 3.处理不同版本间的数据结构变化
     canvas["dsl"] = normalize_chunker_dsl(canvas.get("dsl", {}))
+    # 添加发布时间到响应：将计算出的发布时间添加到返回数据中
     canvas["last_publish_time"] = last_publish_time
 
+    # DataFlow 特殊处理
+    # 1.如果是 DataFlow 类型（数据流/管道）
+    # 2.查询关联的数据集（知识库）
+    # 3.返回数据集 ID、名称、头像
     if canvas.get("canvas_category") == CanvasCategory.DataFlow:
         datasets = list(KnowledgebaseService.query(pipeline_id=agent_id))
         canvas["datasets"] = [{"id": item.id, "name": item.name, "avatar": item.avatar} for item in datasets]
@@ -885,6 +1106,9 @@ def get_agent(agent_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_sync
 def list_agent_versions(agent_id, tenant_id):
+    """
+    获取指定 Agent 的所有版本快照，包括每个版本的 DSL 配置、标题、发布时间等信息。
+    """
     try:
         versions = sorted(
             [item.to_dict() for item in UserCanvasVersionService.list_by_canvas_id(agent_id)],
@@ -900,6 +1124,9 @@ def list_agent_versions(agent_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_sync
 def get_agent_version(agent_id, version_id, tenant_id):
+    """
+    根据 Agent ID 和版本 ID，返回该版本的所有信息，包括 DSL 配置、版本标题、发布时间等。
+    """
     try:
         exists, version = UserCanvasVersionService.get_by_id(version_id)
         if not exists or not version or str(version.user_canvas_id) != str(agent_id):
@@ -914,6 +1141,9 @@ def get_agent_version(agent_id, version_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_async
 async def get_agent_logs(agent_id, message_id, tenant_id):
+    """
+    根据 Agent ID 和消息 ID，从 Redis 中获取该消息的执行日志，用于调试和监控 Agent 的执行过程。
+    """
     try:
         from rag.utils.redis_conn import REDIS_CONN
 
@@ -933,6 +1163,9 @@ async def get_agent_logs(agent_id, message_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_owner_sync
 def delete_agent(agent_id, tenant_id):
+    """
+    删除指定 ID 的 Agent 及其所有关联数据（版本历史、Replica 同步记录等）。
+    """
     UserCanvasService.delete_by_id(agent_id)
     return get_json_result(data=True)
 
@@ -942,12 +1175,19 @@ def delete_agent(agent_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_async
 async def update_agent(agent_id, tenant_id):
+    """
+    更新 Agent 的配置信息，包括标题、DSL、分类、发布状态等，并同步更新版本历史和 Replica 系统。
+    """
+    # 过滤掉 None 值（避免覆盖默认值）
     req = {k: v for k, v in (await get_request_json()).items() if v is not None}
+    # canvas_type 默认为空字符串
     req["canvas_type"] = req.get("canvas_type","")
+    # release 转为布尔值
     req["release"] = bool(req.get("release", ""))
 
     if req.get("dsl") is not None:
         try:
+            # DSL 校验与规范化
             req["dsl"] = CanvasReplicaService.normalize_dsl(req["dsl"])
         except ValueError as exc:
             return get_json_result(
@@ -956,9 +1196,14 @@ async def update_agent(agent_id, tenant_id):
                 code=RetCode.ARGUMENT_ERROR,
             )
 
+    # 标题处理
     if req.get("title") is not None:
         req["title"] = req["title"].strip()
 
+    # 获取当前 Agent 信息
+    # 1.获取当前的 Agent 信息（用于版本标题）
+    # 2.如果更新了标题，使用新标题
+    # 3.否则使用原标题
     _, current_agent = UserCanvasService.get_by_id(agent_id)
     agent_title_for_version = req.get("title") or (current_agent.title if current_agent else "")
     canvas_category = (
@@ -966,15 +1211,25 @@ async def update_agent(agent_id, tenant_id):
         or (current_agent.canvas_category if current_agent else CanvasCategory.Agent)
     )
     owner_nickname = _get_user_nickname(tenant_id)
+    # 更新 Agent
+    # 1.更新数据库中的 Agent 记录
+    # 2.只更新传入的字段
     UserCanvasService.update_by_id(agent_id, req)
 
+    # DSL 更新后的同步操作
+    # 1.只有更新 DSL 时才执行版本和 Replica 同步
+    # 2.版本标题格式：{昵称} - {Agent名称}
+    # 3.Replica 同步失败时返回错误
     if req.get("dsl") is not None:
+        # 1. 创建版本快照
         UserCanvasVersionService.save_or_replace_latest(
             user_canvas_id=agent_id,
             title=UserCanvasVersionService.build_version_title(owner_nickname, agent_title_for_version),
             dsl=req["dsl"],
             release=req.get("release"),
         )
+
+        # 2. 同步到 Replica 系统
         replica_ok = CanvasReplicaService.replace_for_set(
             canvas_id=agent_id,
             tenant_id=str(tenant_id),

@@ -41,15 +41,26 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
     - it only rewrites structural identifiers used by the canvas/runtime
     - custom human-authored names are preserved unless they are still the exact
       built-in legacy operator name
+
+
+    将历史版本的 DSL 配置迁移到当前版本，包括组件名称、ID、引用关系、图表节点等的自动更新。
     """
     if not isinstance(dsl, dict):
         return dsl
 
     normalized = copy.deepcopy(dsl)
     components = normalized.get("components")
+    # 输入校验与深拷贝
+    # 1.确保输入是字典类型
+    # 2.深拷贝避免修改原始数据
+    # 3.如果没有组件，直接返回
     if not isinstance(components, dict):
         return normalized
 
+    # 组件 ID 映射构建
+    # 1.遍历所有组件 ID
+    # 2.检查是否以旧组件名为前缀
+    # 3.替换为新组件名，保留后缀部分
     component_id_map: dict[str, str] = {}
     for component_id in components.keys():
         new_component_id = component_id
@@ -60,6 +71,10 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
                 break
         component_id_map[component_id] = new_component_id
 
+    # 变量引用重写
+    # 1.识别模板变量引用 {{ component_id }}
+    # 2.将变量中的组件 ID 映射为新 ID
+    # 3.保留变量语法结构
     def rewrite_variable_refs(text: str) -> str:
         if text in component_id_map:
             return component_id_map[text]
@@ -75,6 +90,10 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
 
         return VARIABLE_REF_PATTERN.sub(repl, text)
 
+    # 递归值重写
+    # 1.递归遍历所有数据结构
+    # 2.对字符串应用变量引用重写
+    # 3.对列表和字典递归处理
     def rewrite_value(value):
         if isinstance(value, str):
             return rewrite_variable_refs(value)
@@ -84,6 +103,8 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
             return {key: rewrite_value(item) for key, item in value.items()}
         return value
 
+    # 组件对象重写
+    # 创建新的组件字典
     rewritten_components = {}
     for old_component_id, component in components.items():
         new_component_id = component_id_map[old_component_id]
@@ -92,9 +113,14 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
         if isinstance(new_component, dict):
             obj = new_component.get("obj")
             if isinstance(obj, dict):
+                # 更新组件内部的 component_name 字段，使用 COMPONENT_RENAMES 映射
                 component_name = obj.get("component_name")
                 obj["component_name"] = COMPONENT_RENAMES.get(component_name, component_name)
 
+            # 上下游引用更新
+            # 1.更新 downstream（下游组件列表）
+            # 2.更新 upstream（上游组件列表）
+            # 3.使用 ID 映射表转换
             if isinstance(new_component.get("downstream"), list):
                 new_component["downstream"] = [
                     component_id_map.get(component_id, component_id)
@@ -106,6 +132,7 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
                     for component_id in new_component["upstream"]
                 ]
 
+            # 父组件引用更新:更新组件间的父子关系引用
             parent_id = new_component.get("parent_id")
             if isinstance(parent_id, str):
                 new_component["parent_id"] = component_id_map.get(parent_id, parent_id)
@@ -114,12 +141,17 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
 
     normalized["components"] = rewritten_components
 
+    # 路径（Path）更新:更新 DSL 中的路径列表
     if isinstance(normalized.get("path"), list):
         normalized["path"] = [
             component_id_map.get(component_id, component_id)
             for component_id in normalized["path"]
         ]
 
+    # 图形（Graph）节点与边更新
+    # 1.更新节点 ID、类型、标签、名称
+    # 2.更新边的源和目标
+    # 3.递归处理节点表单数据
     graph = normalized.get("graph")
     if isinstance(graph, dict):
         nodes = graph.get("nodes")
@@ -171,6 +203,7 @@ def normalize_chunker_dsl(dsl: dict) -> dict:
                         edge_id = edge_id.replace(old_component_id, new_component_id)
                     edge["id"] = edge_id
 
+    # 其他字段清理：处理历史消息、引用等字段
     for key in ("history", "messages", "reference"):
         if key in normalized:
             normalized[key] = rewrite_value(normalized[key])

@@ -1035,39 +1035,114 @@ class APIToken(DataBaseModel):
 
 
 class API4Conversation(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    name = CharField(max_length=255, null=True, help_text="conversation name", index=False)
-    dialog_id = CharField(max_length=32, null=False, index=True)
-    user_id = CharField(max_length=255, null=False, help_text="user_id", index=True)
-    exp_user_id = CharField(max_length=255, null=True, help_text="exp_user_id", index=True)
-    message = JSONField(null=True)
-    reference = JSONField(null=True, default=[])
-    tokens = IntegerField(default=0)
+    """
+     RAGFlow 中用于存储对话（Conversation）会话记录的数据模型。它隶属于一个名为“数据模型”的代码部分，具体来说，这个类是对话历史与交互记录的核心存储结构。
+     核心功能:用于持久化存储用户与 RAGFlow 系统交互时的完整对话记录，包括对话内容、引用来源、用户反馈和性能指标等。它是实现会话管理、历史回溯、质量分析和交互优化的数据基础。
+     1. 多源支持
     source = CharField(max_length=16, null=True, help_text="none|agent|dialog", index=True)
-    dsl = JSONField(null=True, default={})
-    duration = FloatField(default=0, index=True)
-    round = IntegerField(default=0, index=True)
-    thumb_up = IntegerField(default=0, index=True)
-    errors = TextField(null=True, help_text="errors")
-    version_title = CharField(max_length=255, null=True, help_text="canvas version title when session created", index=False)
+    dialog：普通对话
+    agent：Agent 智能体对话
+    none：未指定来源
+
+    支持按来源类型索引查询
+
+    2. 完整的追踪能力
+    tokens = IntegerField(default=0)      # 成本追踪
+    duration = FloatField(default=0)      # 性能追踪
+    errors = TextField(null=True)         # 错误追踪
+    thumb_up = IntegerField(default=0)    # 质量反馈
+    便于进行成本分析、性能优化和质量评估
+
+    3. 版本快照
+    version_title = CharField(max_length=255, null=True)
+    1.记录对话创建时使用的对话流版本
+    2.便于版本回滚和对比分析
+
+    4. 实验支持
+    exp_user_id = CharField(max_length=255, null=True, index=True)
+    1.支持 A/B 测试场景
+    2.可区分真实用户和实验用户
+
+    💡 使用场景
+    场景	        使用的字段	说明
+    对话历史展示	message, reference	展示完整对话和引用
+    使用量统计	tokens, duration, round	统计用户使用情况
+    质量分析	    thumb_up, errors	分析回答质量
+    A/B 测试	    exp_user_id, source	对比不同版本效果
+    成本账单	    tokens, user_id	按用户/租户计费
+     e.g:
+     {
+        "id": "conv_abc123",
+        "name": "技术咨询-2024-01-15",
+        "dialog_id": "dialog_001",
+        "user_id": "user_001",
+        "exp_user_id": null,
+        "message": [
+            {"role": "user", "content": "如何优化Python代码？"},
+            {"role": "assistant", "content": "可以从以下几个方面优化..."},
+            {"role": "user", "content": "具体如何优化循环？"},
+            {"role": "assistant", "content": "循环优化建议：..."}
+        ],
+        "reference": [
+            {"doc_id": "doc_001", "chunk_id": "chunk_001", "content": "Python性能优化指南"},
+            {"doc_id": "doc_002", "chunk_id": "chunk_003", "content": "循环优化技巧"}
+        ],
+        "tokens": 1520,
+        "source": "agent",
+        "dsl": {"nodes": [...], "edges": [...]},
+        "duration": 2.35,
+        "round": 4,
+        "thumb_up": 1,
+        "errors": null,
+        "version_title": "v2.0 优化版"
+    }
+    """
+    # 标识与关联字段
+    id = CharField(max_length=32, primary_key=True)                                                     # 主键，对话的唯一标识符
+    name = CharField(max_length=255, null=True, help_text="conversation name", index=False)             # 对话名称，可为空
+    dialog_id = CharField(max_length=32, null=False, index=True)                                        # 关联的对话流/应用 ID，用于关联到具体的对话应用
+    user_id = CharField(max_length=255, null=False, help_text="user_id", index=True)                    # 用户 ID，标识对话所属用户
+    exp_user_id = CharField(max_length=255, null=True, help_text="exp_user_id", index=True)             # 实验用户 ID，用于 A/B 测试或匿名用户追踪
+    # 内容与数据字段
+    message = JSONField(null=True)                                                                      # 对话消息记录，存储完整的对话轮次
+    reference = JSONField(null=True, default=[])                                                        # 引用来源，记录回答所引用的文档或知识片段
+    dsl = JSONField(null=True, default={})                                                              # DSL，记录对话所使用的对话流/应用
+    errors = TextField(null=True, help_text="errors")                                                   # 错误信息，记录对话中的异常
+    # 状态与元数据字段
+    source = CharField(max_length=16, null=True, help_text="none|agent|dialog", index=True)             # 来源，记录对话来源，如：none（无来源）、agent（对话助手）、dialog（对话应用）
+    tokens = IntegerField(default=0)                                                                    # 对话消耗的 token 数
+    duration = FloatField(default=0, index=True)                                                        # 对话耗时，记录对话所花费的时间
+    round = IntegerField(default=0, index=True)                                                         # 对话轮次计数
+    thumb_up = IntegerField(default=0, index=True)                                                      # 用户点赞数（反馈）
+    version_title = CharField(max_length=255, null=True, help_text="canvas version title when session created", index=False)    # 对话流版本标题，记录创建时的版本快照
 
     class Meta:
         db_table = "api_4_conversation"
 
 
 class UserCanvas(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    avatar = TextField(null=True, help_text="avatar base64 string")
-    user_id = CharField(max_length=255, null=False, help_text="user_id", index=True)
-    title = CharField(max_length=255, null=True, help_text="Canvas title")
+    """
+     Agent（智能体）和 Canvas（画布）的核心存储结构。这个模型用于持久化存储用户创建的 Agent 配置、元数据和状态信息。
+     核心功能:存储 Agent/Canvas 的完整信息，包括基本属性、权限控制、发布状态、标签分类和 DSL 配置。
+    """
+    # 标识与基本信息
+    id = CharField(max_length=32, primary_key=True) # 主键，Agent/Canvas 的唯一标识符
+    avatar = TextField(null=True, help_text="avatar base64 string") #头像，Base64 编码的图片数据
+    user_id = CharField(max_length=255, null=False, help_text="user_id", index=True) # 所有者用户 ID，标识 Agent 的创建者
+    title = CharField(max_length=255, null=True, help_text="Canvas title")  # 名称，Agent 的显示名称
+    description = TextField(null=True, help_text="Canvas description") # 描述，Agent 的详细说明
 
-    permission = CharField(max_length=16, null=False, help_text="me|team", default="me", index=True)
-    release = BooleanField(null=False, help_text="is released", default=False, index=True)
-    description = TextField(null=True, help_text="Canvas description")
-    canvas_type = CharField(max_length=32, null=True, help_text="Canvas type", index=True)
-    canvas_category = CharField(max_length=32, null=False, default="agent_canvas", help_text="Canvas category: agent_canvas|dataflow_canvas", index=True)
-    tags = CharField(max_length=512, null=False, default="", help_text="Comma-separated tags for organizing agents", index=True)
-    dsl = JSONField(null=True, default={})
+    # 权限与状态控制
+    permission = CharField(max_length=16, null=False, help_text="me|team", default="me", index=True) # 权限级别：me（私有）/ team（团队共享）
+    release = BooleanField(null=False, help_text="is released", default=False, index=True) # 发布状态：True 表示已发布，False 表示草稿
+
+    # 分类与组织
+    canvas_type = CharField(max_length=32, null=True, help_text="Canvas type", index=True) # 画布类型，用于扩展分类
+    canvas_category = CharField(max_length=32, null=False, default="agent_canvas", help_text="Canvas category: agent_canvas|dataflow_canvas", index=True) # 画布类别：agent_canvas（智能体）/ dataflow_canvas（数据流）
+    tags = CharField(max_length=512, null=False, default="", help_text="Comma-separated tags for organizing agents", index=True) # 标签，逗号分隔的标签列表，用于分类和搜索
+
+    # 核心配置
+    dsl = JSONField(null=True, default={}) # DSL 配置，定义 Agent 的工作流、节点、工具等
 
     class Meta:
         db_table = "user_canvas"
