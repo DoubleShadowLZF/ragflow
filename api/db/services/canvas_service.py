@@ -311,15 +311,22 @@ class UserCanvasService(CommonService):
 
 
 async def completion(tenant_id, agent_id, session_id=None, **kwargs):
-    query = kwargs.get("query", "") or kwargs.get("question", "")
-    files = kwargs.get("files", [])
-    inputs = kwargs.get("inputs", {})
-    user_id = kwargs.get("user_id", "")
-    chat_template_kwargs = kwargs.get("chat_template_kwargs")
-    custom_header = kwargs.get("custom_header", "")
-    release_mode = str(kwargs.get("release", "")).strip().lower()
+    """
+    RAGFlow 中 Agent 执行的核心函数。它负责创建或恢复会话，执行 Canvas 工作流，并将执行结果持久化到会话中。
+    核心功能:执行 Agent 工作流，处理用户输入，收集响应内容，并更新会话状态。
+    """
+    query = kwargs.get("query", "") or kwargs.get("question", "") # query 或 question：用户查询
+    files = kwargs.get("files", []) # 上传的文件
+    inputs = kwargs.get("inputs", {}) # 自定义输入参数
+    user_id = kwargs.get("user_id", "") # 用户 ID
+    chat_template_kwargs = kwargs.get("chat_template_kwargs") # 聊天模板参数
+    custom_header = kwargs.get("custom_header", "") # 自定义请求头
+    release_mode = str(kwargs.get("release", "")).strip().lower() # 是否使用发布版本
 
+    # 会话恢复或创建
+    # 已有会话（通过 session_id）
     if session_id:
+        # 从数据库加载会话
         e, conv = await thread_pool_exec(API4ConversationService.get_by_id, session_id)
         if not e:
             raise LookupError("Session not found!")
@@ -327,26 +334,36 @@ async def completion(tenant_id, agent_id, session_id=None, **kwargs):
             conv.message = []
         if not isinstance(conv.dsl, str):
             conv.dsl = json.dumps(conv.dsl, ensure_ascii=False)
+        # 使用会话中保存的 DSL,恢复 Canvas 状态
         canvas = Canvas(conv.dsl, tenant_id, agent_id, canvas_id=agent_id, custom_header=custom_header)
+    # 新会话（无 session_id）
     else:
+        # 获取 Agent 的 DSL（草稿或发布版本）
         cvs, dsl = await thread_pool_exec(UserCanvasService.get_agent_dsl_with_release, agent_id, release_mode=release_mode == "true", tenant_id=tenant_id)
 
         session_id = get_uuid()
+        # 创建新的 Canvas 实例
         canvas = Canvas(dsl, tenant_id, agent_id, canvas_id=cvs.id, custom_header=custom_header)
+        # 重置 Canvas 状态
         canvas.reset()
         # Get the version title based on release_mode
         version_title = await thread_pool_exec(UserCanvasVersionService.get_latest_version_title, cvs.id, release_mode=release_mode == "true")
         conv = {"id": session_id, "dialog_id": cvs.id, "user_id": user_id, "message": [], "source": "agent", "dsl": dsl, "reference": [], "version_title": version_title}
         await thread_pool_exec(API4ConversationService.save, **conv)
+        # 创建新会话
         conv = API4Conversation(**conv)
 
+    # 添加用户消息
+    # 生成消息 ID
     message_id = str(uuid4())
+    # 将用户消息添加到会话中
     conv.message.append({
         "role": "user",
         "content": query,
         "id": message_id,
         "files": files
     })
+    # 执行 Canvas 工作流
     txt = ""
     run_kwargs = {
         "query": query,
@@ -354,9 +371,11 @@ async def completion(tenant_id, agent_id, session_id=None, **kwargs):
         "user_id": user_id,
         "inputs": inputs,
     }
+    # 收集完整的响应内容
     if chat_template_kwargs is not None:
         run_kwargs["chat_template_kwargs"] = chat_template_kwargs
 
+    # 处理思考标记（<think> 和 </think>）
     async for ans in canvas.run(**run_kwargs):
         ans["session_id"] = session_id
         if ans["event"] == "message":
@@ -365,21 +384,69 @@ async def completion(tenant_id, agent_id, session_id=None, **kwargs):
                 txt += "<think>"
             elif ans["data"].get("end_to_think", False):
                 txt += "</think>"
+        # 实时输出事件流
         yield "data:" + json.dumps(ans, ensure_ascii=False) + "\n\n"
 
-    conv.message.append({"role": "assistant", "content": txt, "created_at": time.time(), "id": message_id})
-    conv.reference = canvas.get_reference()
-    conv.errors = canvas.error
-    conv.dsl = str(canvas)
-    conv = conv.to_dict()
+    # 持久化会话状态
+    conv.message.append({"role": "assistant", "content": txt, "created_at": time.time(), "id": message_id}) # 添加助手回复到会话
+    conv.reference = canvas.get_reference() # 保存引用信息
+    conv.errors = canvas.error # 保存错误信息
+    conv.dsl = str(canvas) # 更新 DSL（可能包含运行时状态变化）
+    conv = conv.to_dict() # 保存到数据库
     await thread_pool_exec(API4ConversationService.append_message, conv["id"], conv)
 
 
 async def completion_openai(tenant_id, agent_id, question, session_id=None, stream=True, **kwargs):
-    tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
-    prompt_tokens = len(tiktoken_encoder.encode(str(question)))
+    """
+    将 RAGFlow Agent 的 completion 函数输出转换为 OpenAI Chat Completion API 格式。
+
+    流式响应格式
+    data: {
+        "id": "session_id",
+        "model": "agent_id",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "delta": {
+                "content": "你好",
+                "reference": {"doc_id": {...}}
+            },
+            "index": 0,
+            "finish_reason": null
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        }
+    }
+
+    非流式响应格式
+    {
+        "id": "session_id",
+        "model": "agent_id",
+        "object": "chat.completion",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "完整的回答内容...",
+                "reference": {"doc_id": {...}}
+            },
+            "index": 0,
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 50,
+            "total_tokens": 60
+        }
+    }
+
+    """
+    tiktoken_encoder = tiktoken.get_encoding("cl100k_base") # cl100k_base 是 GPT-4 使用的编码器
+    prompt_tokens = len(tiktoken_encoder.encode(str(question))) # 使用 tiktoken 计算 Token 数（OpenAI 兼容需要）
     user_id = kwargs.get("user_id", "")
 
+    # 流式响应模式
     if stream:
         completion_tokens = 0
         try:
@@ -391,9 +458,10 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                 user_id=user_id,
                 **kwargs
             ):
+                # 解析响应
                 if isinstance(ans, str):
                     try:
-                        ans = json.loads(ans[5:])  # remove "data:"
+                        ans = json.loads(ans[5:])  # remove "data:" # 移除 "data:" 前缀
                     except Exception as e:
                         logging.exception(f"Agent OpenAI-Compatible completion_openai parse answer failed: {e}")
                         continue
@@ -401,11 +469,13 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                     continue
 
                 content_piece = ""
+                # 只处理 message 事件
                 if ans["event"] == "message":
                     content_piece = ans["data"]["content"]
 
                 completion_tokens += len(tiktoken_encoder.encode(content_piece))
 
+                # 构建 OpenAI 格式响应
                 openai_data = get_data_openai(
                         id=session_id or str(uuid4()),
                         model=agent_id,
@@ -415,6 +485,7 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                         stream=True
                     )
 
+                # 添加引用信息
                 if ans.get("data", {}).get("reference", None):
                     openai_data["choices"][0]["delta"]["reference"] = ans["data"]["reference"]
 
@@ -422,6 +493,7 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
 
             yield "data: [DONE]\n\n"
 
+        #  流式错误处理
         except Exception as e:
             logging.exception(e)
             yield "data: " + json.dumps(
@@ -438,6 +510,7 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
             ) + "\n\n"
             yield "data: [DONE]\n\n"
 
+    # 非流式响应模式
     else:
         try:
             all_content = ""
@@ -450,8 +523,13 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
                 user_id=user_id,
                 **kwargs
             ):
+                # 收集所有内容
+                # SSE 数据解析
                 if isinstance(ans, str):
-                    ans = json.loads(ans[5:])
+                    ans = json.loads(ans[5:]) # 移除 "data:" 前缀
+                # 事件过滤
+                # 1.只转换 message 和 message_end 事件
+                # 2.忽略内部调试事件
                 if ans.get("event") not in ["message", "message_end"]:
                     continue
 
@@ -463,6 +541,7 @@ async def completion_openai(tenant_id, agent_id, question, session_id=None, stre
 
             completion_tokens = len(tiktoken_encoder.encode(all_content))
 
+            # 构建完整响应
             openai_data = get_data_openai(
                 id=session_id or str(uuid4()),
                 model=agent_id,

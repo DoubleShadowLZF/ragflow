@@ -199,7 +199,31 @@ async def _run_workflow_session(
     stream,
     chat_template_kwargs=None,
 ):
+    """
+    RAGFlow 中 Workflow 会话执行的核心逻辑。它负责执行 Canvas 工作流，处理流式和非流式响应，并在执行完成后持久化会话状态。
+    核心功能 : 执行 Canvas 工作流，处理用户输入，收集响应内容，并更新会话状态。
+
+    :param tenant_id：租户 ID
+    :param agent_id：Agent ID
+    :param workflow_conv：会话数据
+    :param canvas：Canvas 实例（工作流引擎）
+    :param query：用户查询
+    :param files：上传的文件
+    :param inputs：自定义输入
+    :param user_id：用户 ID
+    :param session_id：会话 ID
+    :param custom_header：自定义请求头
+    :param canvas_title：Canvas 标题
+    :param canvas_category：Canvas 类型
+    :param return_trace：是否返回追踪信息
+    :param stream：是否流式响应
+    :param chat_template_kwargs：聊天模板参数
+    :return:
+    """
+    # 内部函数：提交 Replica
     async def commit_runtime_replica():
+        # 执行完成后将 Canvas 状态提交到 Replica 系统
+        # 确保分布式执行环境同步
         commit_ok = CanvasReplicaService.commit_after_run(
             canvas_id=agent_id,
             tenant_id=str(tenant_id),
@@ -216,6 +240,10 @@ async def _run_workflow_session(
                 user_id,
             )
 
+    # 规范化引用数据
+    # 1.兼容不同格式的引用数据
+    # 2.统一为列表格式
+    # 3.规范化引用条目
     workflow_conv.setdefault("message", [])
     if isinstance(workflow_conv.get("reference"), dict):
         if "chunks" in workflow_conv["reference"]:
@@ -228,12 +256,13 @@ async def _run_workflow_session(
         workflow_conv["reference"] = []
     workflow_conv["reference"] = [_normalize_agent_reference_entry(reference) for reference in workflow_conv["reference"]]
 
+    # 初始化变量
     turn_id = workflow_conv["message"][-1].get("id") if workflow_conv["message"] else get_uuid()
-    full_content = ""
-    reference = {}
-    final_ans = {}
-    trace_items = []
-    structured_output = {}
+    full_content = "" # 累积的完整响应内容
+    reference = {} # 累积的引用信息
+    final_ans = {} # 最终响应
+    trace_items = [] # 追踪信息（调试用）
+    structured_output = {} # 结构化输出
     run_kwargs = {
         "query": query,
         "files": files,
@@ -243,6 +272,11 @@ async def _run_workflow_session(
     if chat_template_kwargs is not None:
         run_kwargs["chat_template_kwargs"] = chat_template_kwargs
 
+    # 内部函数：持久化会话
+    # 1.在会话中添加助手回复
+    # 2.更新引用信息
+    # 3.保存更新后的 DSL
+    # 4.提交到 Replica
     async def persist_workflow_session():
         if not final_ans:
             return
@@ -260,18 +294,22 @@ async def _run_workflow_session(
         await thread_pool_exec(API4ConversationService.append_message, session_id, workflow_conv)
         await commit_runtime_replica()
 
+    # 流式响应处理
     if stream:
-
         async def sse():
             nonlocal full_content, reference, final_ans, trace_items, structured_output
             done_sent = False
             try:
                 async for ans in canvas.run(**run_kwargs):
                     ans["session_id"] = session_id
+                    # 处理消息事件
+                    # message : 累积内容
                     if ans.get("event") == "message":
                         full_content += ans.get("data", {}).get("content", "")
+                    # reference : 收集引用
                     if ans.get("data", {}).get("reference", None):
                         reference.update(ans["data"]["reference"])
+                    # node_finished ： 收集节点输出
                     if ans.get("event") == "node_finished":
                         data = ans.get("data", {})
                         node_out = data.get("outputs", {})
@@ -288,6 +326,7 @@ async def _run_workflow_session(
                     final_ans = ans
                     yield "data:" + json.dumps(ans, ensure_ascii=False) + "\n\n"
 
+                # 完成时发送最终数据
                 if final_ans:
                     if "data" not in final_ans or not isinstance(final_ans["data"], dict):
                         final_ans["data"] = {}
@@ -313,13 +352,18 @@ async def _run_workflow_session(
 
         return _build_sse_response(sse())
 
+    # 非流式响应处理
     try:
         async for ans in canvas.run(**run_kwargs):
+            # 同样的事件处理逻辑
             ans["session_id"] = session_id
+            # message : 累积内容
             if ans.get("event") == "message":
                 full_content += ans.get("data", {}).get("content", "")
+            # reference : 收集引用
             if ans.get("data", {}).get("reference", None):
                 reference.update(ans["data"]["reference"])
+            # node_finished ： 收集节点输出
             if ans.get("event") == "node_finished":
                 data = ans.get("data", {})
                 node_out = data.get("outputs", {})
@@ -339,6 +383,7 @@ async def _run_workflow_session(
         canvas.cancel_task()
         return get_result(data=f"**ERROR**: {str(exc)}")
 
+    # 构建最终响应
     if not final_ans:
         await commit_runtime_replica()
         return get_result(data={})
@@ -611,16 +656,36 @@ async def download_agent_file(tenant_id):
 
 async def _iter_session_completion_events(tenant_id, agent_id, req, return_trace):
     # Stream and non-stream session completions share the same event parsing and trace injection.
+    """
+    RAGFlow 中 会话完成事件迭代器，负责处理 Agent 执行过程中产生的事件流，并注入追踪信息。
+    核心功能 : 迭代 Agent 执行事件，处理 node_finished 事件以收集追踪信息，并将所有事件传递给上层调用者。
+    :param tenant_id：租户 ID
+    :param agent_id：Agent ID
+    :param req：请求参数
+    :param return_trace：是否返回追踪信息
+    :return:
+    """
+    # 初始化追踪存储
+    # 1.存储所有节点完成的追踪信息
+    # 2.用于调试和性能分析
     trace_items = []
+    # 迭代 Agent 执行事件
+    # 1.调用 agent_completion 获取事件流
+    # 2.支持字符串（SSE 格式）和字典两种格式
+    # 3.解析失败时跳过
     async for answer in agent_completion(tenant_id=tenant_id, agent_id=agent_id, **req):
         if isinstance(answer, str):
             try:
-                ans = json.loads(answer[5:])
+                ans = json.loads(answer[5:]) # 移除 "data:" 前缀
             except Exception:
                 continue
         else:
             ans = answer
 
+        # 处理 node_finished 事件
+        # 1.只有 return_trace=True 时才收集追踪信息
+        # 2.保存组件 ID 和完整的节点执行数据
+        # 3.将累积的追踪信息注入到事件中
         event = ans.get("event")
         if event == "node_finished":
             if return_trace:
@@ -635,6 +700,9 @@ async def _iter_session_completion_events(tenant_id, agent_id, req, return_trace
             yield ans
             continue
 
+        # 处理其他事件
+        # 1.只传递 message 和 message_end 事件
+        # 2.其他事件被忽略
         if event in ["message", "message_end"]:
             yield ans
 
@@ -1249,6 +1317,9 @@ async def update_agent(agent_id, tenant_id):
 @add_tenant_id_to_kwargs
 @_require_canvas_access_async
 async def reset_agent(agent_id, tenant_id):
+    """
+    重置 Agent 的执行状态，清空运行时缓存和中间状态，使 Agent 回到初始配置状态。
+    """
     try:
         from agent.canvas import Canvas
 
@@ -1256,10 +1327,18 @@ async def reset_agent(agent_id, tenant_id):
         if not exists:
             return get_data_error_result(message="canvas not found.")
 
+        # 重置 Canvas 状态
+        # 使用当前的 DSL 创建 Canvas 实例
         canvas = Canvas(json.dumps(user_canvas.dsl), tenant_id, canvas_id=user_canvas.id)
+        # 调用 reset() 方法重置状态（清空缓存、重置计数器等）
         canvas.reset()
+        # 将重置后的 Canvas 序列化为 JSON DSL
         dsl = json.loads(str(canvas))
+        # 更新数据库
         UserCanvasService.update_by_id(agent_id, {"dsl": dsl})
+        # 同步到 Replica 系统
+        # 1.将重置后的 DSL 同步到 Replica 系统
+        # 2.确保分布式执行环境的一致性
         replica_ok = CanvasReplicaService.replace_for_set(
             canvas_id=agent_id,
             tenant_id=str(tenant_id),
@@ -1280,28 +1359,43 @@ async def reset_agent(agent_id, tenant_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def rerun_agent(tenant_id):
+    """
+    重新运行指定文档的处理流程，包括清理旧数据、重置文档状态、更新管道配置，并触发重新处理任务。
+    """
     from rag.nlp import search
 
     req = await get_request_json()
+    # 获取文档信息
     doc = PipelineOperationLogService.get_documents_info(req["id"])
     if not doc:
         return get_data_error_result(message="Document not found.")
     doc = doc[0]
+    # 检查文档处理状态
+    # 1.如果文档正在处理中（进度在 0 到 1 之间），阻止重新运行
+    # 2.避免并发处理冲突
     if 0 < doc["progress"] < 1:
         return get_data_error_result(message=f"`{doc['name']}` is processing...")
 
+    # 清理向量索引中的数据
+    # 1.检查向量索引是否存在
+    # 2.删除该文档在向量数据库中的旧数据
     if settings.docStoreConn.index_exist(search.index_name(tenant_id), doc["kb_id"]):
         settings.docStoreConn.delete({"doc_id": doc["id"]}, search.index_name(tenant_id), doc["kb_id"])
-    doc["progress_msg"] = ""
-    doc["chunk_num"] = 0
-    doc["token_num"] = 0
-    DocumentService.clear_chunk_num_when_rerun(doc["id"])
+    # 重置文档状态
+    doc["progress_msg"] = "" # 清空进度消息
+    doc["chunk_num"] = 0 # 分块数量重置为 0
+    doc["token_num"] = 0 # Token 数量重置为 0
+    DocumentService.clear_chunk_num_when_rerun(doc["id"]) # 清除文档的分块数量记录
     DocumentService.update_by_id(doc["id"], doc)
-    TaskService.filter_delete([Task.doc_id == doc["id"]])
+    TaskService.filter_delete([Task.doc_id == doc["id"]]) # 删除该文档的待处理任务
 
+    # 更新管道 DSL
     dsl = req["dsl"]
-    dsl["path"] = [req["component_id"]]
-    PipelineOperationLogService.update_by_id(req["id"], {"dsl": dsl})
+    dsl["path"] = [req["component_id"]] # 设置管道路径为指定的组件 ID
+    PipelineOperationLogService.update_by_id(req["id"], {"dsl": dsl}) # 更新管道操作日志中的 DSL 配置
+    # 触发重新处理任务
+    # 1.将文档处理任务放入队列
+    # 2.rerun=True 标记为重新运行
     queue_dataflow(
         tenant_id=tenant_id,
         flow_id=req["id"],
@@ -1469,6 +1563,22 @@ async def agent_chat_completion(tenant_id, agent_id=None):
     # Response modes:
     # - Regular mode emits internal agent events.
     # - openai-compatible mode reshapes the same execution into an OpenAI-like wire format.
+    """
+    是 RAGFlow Agent 对话的核心入口:执行 Agent 对话，支持会话管理、多模式执行、流式响应和 OpenAI API 兼容。
+
+    响应模式对比
+    模式	                    响应类型	                    适用场景
+    流式 (stream=True)	    SSE (Server-Sent Events)	实时对话，逐步显示
+    非流式 (stream=False)	完整 JSON	                API 调用，非实时场景
+    OpenAI 兼容	            OpenAI API 格式	            与 OpenAI SDK 集成
+
+    执行模式对比
+    模式	                触发条件	                        特点
+    草稿执行	            无 session_id	                从 Replica 加载配置，创建新会话
+    会话延续	            有 session_id	                从已有会话恢复上下文
+    DataFlow	        canvas_category == DataFlow	    异步处理，返回任务 ID
+    Agent	            canvas_category == Agent	    同步处理，返回对话结果
+    """
     req = await get_request_json()
     agent_id = agent_id or req.get("agent_id")
     openai_compatible = bool(req.get("openai-compatible", False))
@@ -1479,22 +1589,27 @@ async def agent_chat_completion(tenant_id, agent_id=None):
             code=RetCode.ARGUMENT_ERROR,
         )
     # Route-level selectors should not be forwarded into the lower-level completion functions.
+    # 移除路由级参数，避免传递到下层
     req = dict(req)
     req.pop("agent_id", None)
     req.pop("openai-compatible", None)
+    # 会话验证（存量会话）
     session_id = req.get("session_id")
     workflow_session = False
     workflow_conv = None
+    # 验证会话是否存在
     if session_id:
         exists, conv = API4ConversationService.get_by_id(session_id)
         if not exists:
             return get_data_error_result(message="Session not found!")
+        # 确保会话属于指定的 Agent
         if conv.dialog_id != agent_id:
             return get_json_result(
                 data=False,
                 message="Session does not belong to the requested agent.",
                 code=RetCode.OPERATING_ERROR,
             )
+        # 确保用户有权限访问
         if not UserCanvasService.accessible(agent_id, tenant_id):
             return get_json_result(
                 data=False,
@@ -1505,6 +1620,10 @@ async def agent_chat_completion(tenant_id, agent_id=None):
         if workflow_session:
             workflow_conv = conv.to_dict()
 
+    # OpenAI 兼容模式
+    # 1.兼容 OpenAI API 格式
+    # 2.支持流式和非流式响应
+    # 3.从 messages 中提取用户问题
     if openai_compatible:
         # OpenAI-compatible mode uses a different wire format, keep it separate from regular agent events.
         messages = req.get("messages", [])
@@ -1536,6 +1655,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
             return jsonify(response)
         return None
 
+    # Workflow 会话模式
     if workflow_session:
         query = req.get("query", "") or req.get("question", "")
         files = req.get("files", [])
@@ -1544,6 +1664,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
         user_id = str(runtime_user_id)
         custom_header = req.get("custom_header", "")
 
+        # 获取 Canvas 配置
         _, cvs = await thread_pool_exec(UserCanvasService.get_by_id, agent_id)
         if not cvs:
             return get_data_error_result(message="canvas not found.")
@@ -1559,7 +1680,9 @@ async def agent_chat_completion(tenant_id, agent_id=None):
                 ]
         elif not isinstance(workflow_conv.get("reference"), list):
             workflow_conv["reference"] = []
+        # 规范化引用数据
         workflow_conv["reference"] = [_normalize_agent_reference_entry(reference) for reference in workflow_conv["reference"]]
+        # 添加用户消息
         turn_id = get_uuid()
         workflow_conv["message"].append(
             {
@@ -1580,6 +1703,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
                 dsl_str = workflow_dsl
             else:
                 dsl_str = json.dumps(workflow_dsl, ensure_ascii=False)
+            # 创建 Canvas 并运行
             canvas = Canvas(dsl_str, str(tenant_id), canvas_id=agent_id, custom_header=custom_header)
         except Exception as exc:
             return server_error_response(exc)
@@ -1602,6 +1726,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
             chat_template_kwargs=req.get("chat_template_kwargs"),
         )
 
+    # 无会话模式（新对话）
     if not session_id:
         if not UserCanvasService.accessible(agent_id, tenant_id):
             return get_json_result(
@@ -1750,6 +1875,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
             chat_template_kwargs=req.get("chat_template_kwargs"),
         )
 
+    # 流式响应模式
     return_trace = bool(req.get("return_trace", False))
     if req.get("stream", True):
 
@@ -1760,6 +1886,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
 
         return _build_sse_response(generate())
 
+    # 非流式响应模式
     full_content = ""
     reference = {}
     final_ans = {}
@@ -1767,6 +1894,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
     structured_output = {}
     async for ans in _iter_session_completion_events(tenant_id, agent_id, req, return_trace):
         try:
+            # 收集所有事件
             if ans["event"] == "message":
                 full_content += ans["data"]["content"]
             if ans.get("data", {}).get("reference", None):
@@ -1793,6 +1921,7 @@ async def agent_chat_completion(tenant_id, agent_id=None):
 
     if "data" not in final_ans or not isinstance(final_ans["data"], dict):
         final_ans["data"] = {}
+    # 聚合响应
     final_ans["data"]["content"] = full_content
     final_ans["data"]["reference"] = reference
     if structured_output:
@@ -1805,15 +1934,31 @@ async def agent_chat_completion(tenant_id, agent_id=None):
 @manager.route("/agents/<agent_id>/webhook", methods=["POST", "GET", "PUT", "PATCH", "DELETE", "HEAD"])  # noqa: F821
 @manager.route("/agents/<agent_id>/webhook/test",methods=["POST", "GET", "PUT", "PATCH", "DELETE", "HEAD"],)  # noqa: F821
 async def webhook(agent_id: str):
+    """
+    通过 HTTP Webhook 触发 Agent 执行，支持安全验证、请求解析、流式和非流式响应。
+
+    多种安全机制
+    安全机制	            说明
+    最大 Body 大小	    防止大请求攻击
+    IP 白名单	        限制来源 IP
+    限流	                令牌桶算法
+    Token 认证	        自定义 Header Token
+    Basic Auth	        HTTP 基本认证
+    JWT 认证	            支持自定义 Claims
+
+    """
     is_test = request.path.startswith(f"/api/v1/agents/{agent_id}/webhook/test")
     start_ts = time.time()
 
     # 1. Fetch canvas by agent_id
+    # 获取并验证 Canvas
     exists, cvs = UserCanvasService.get_by_id(agent_id)
+    # 检查 Agent 是否存在
     if not exists:
         return get_data_error_result(code=RetCode.BAD_REQUEST,message="Canvas not found."),RetCode.BAD_REQUEST
 
     # 2. Check canvas category
+    # DataFlow 类型不支持 Webhook
     if cvs.canvas_category == CanvasCategory.DataFlow:
         return get_data_error_result(code=RetCode.BAD_REQUEST,message="Dataflow can not be triggered by webhook."),RetCode.BAD_REQUEST
 
@@ -1823,6 +1968,9 @@ async def webhook(agent_id: str):
         return get_data_error_result(code=RetCode.BAD_REQUEST,message="Invalid DSL format."),RetCode.BAD_REQUEST
 
     # 4. Check webhook configuration in DSL
+    # 加载 Webhook 配置
+    # 1.从 DSL 中查找配置了 Webhook 模式的 Begin 组件
+    # 2.提取 Webhook 配置
     webhook_cfg = {}
     components = dsl.get("components", {})
     for k, _ in components.items():
@@ -1834,6 +1982,7 @@ async def webhook(agent_id: str):
         return get_data_error_result(code=RetCode.BAD_REQUEST,message="Webhook not configured for this agent."),RetCode.BAD_REQUEST
 
     # 5. Validate request method against webhook_cfg.methods
+    # 验证 HTTP 方法
     allowed_methods = webhook_cfg.get("methods", [])
     request_method = request.method.upper()
     if allowed_methods and request_method not in allowed_methods:
@@ -1842,6 +1991,7 @@ async def webhook(agent_id: str):
         ),RetCode.BAD_REQUEST
 
     # 6. Validate webhook security
+    # 安全验证
     async def validate_webhook_security(security_cfg: dict):
         """Validate webhook security rules based on security configuration."""
 
@@ -1849,6 +1999,7 @@ async def webhook(agent_id: str):
             return  # No security config → allowed by default
 
         # 1. Validate max body size
+        # 最大 Body 大小验证
         await _validate_max_body_size(security_cfg)
 
         # 2. Validate IP whitelist
@@ -1876,12 +2027,15 @@ async def webhook(agent_id: str):
             raise Exception(f"Unsupported auth_type: {auth_type}")
 
     async def _validate_max_body_size(security_cfg):
-        """Check request size does not exceed max_body_size."""
+        """Check request size does not exceed max_body_size.
+        最大 Body 大小验证
+        """
         max_size = security_cfg.get("max_body_size")
         if not max_size:
             return
 
         # Convert "10MB" → bytes
+        # 解析 "10MB" 格式
         units = {"kb": 1024, "mb": 1024**2}
         size_str = max_size.lower()
 
@@ -1892,6 +2046,7 @@ async def webhook(agent_id: str):
         else:
             raise Exception("Invalid max_body_size format")
         MAX_LIMIT = 10 * 1024 * 1024  # 10MB
+        # 验证是否超过 10MB 限制
         if limit > MAX_LIMIT:
             raise Exception("max_body_size exceeds maximum allowed size (10MB)")
 
@@ -1900,7 +2055,9 @@ async def webhook(agent_id: str):
             raise Exception(f"Request body too large: {content_length} > {limit}")
 
     def _validate_ip_whitelist(security_cfg):
-        """Allow only IPs listed in ip_whitelist."""
+        """Allow only IPs listed in ip_whitelist.
+        IP 白名单验证
+        """
         whitelist = security_cfg.get("ip_whitelist", [])
         if not whitelist:
             return
@@ -1909,19 +2066,21 @@ async def webhook(agent_id: str):
 
 
         for rule in whitelist:
-            if "/" in rule:
+            if "/" in rule: # CIDR 格式
                 # CIDR notation
                 if ipaddress.ip_address(client_ip) in ipaddress.ip_network(rule, strict=False):
                     return
             else:
-                # Single IP
+                # Single IP # 单个 IP
                 if client_ip == rule:
                     return
 
         raise Exception(f"IP {client_ip} is not allowed by whitelist")
 
     def _validate_rate_limit(security_cfg):
-        """Simple in-memory rate limiting."""
+        """Simple in-memory rate limiting.
+        限流验证（基于 Redis 令牌桶）
+        """
         rl = security_cfg.get("rate_limit")
         if not rl:
             return
@@ -1951,6 +2110,7 @@ async def webhook(agent_id: str):
         try:
             from rag.utils.redis_conn import REDIS_CONN
 
+            # 使用 Redis Lua 令牌桶算法
             res = REDIS_CONN.lua_token_bucket(
                 keys=[key],
                 args=[capacity, rate, now, cost],
@@ -1965,7 +2125,9 @@ async def webhook(agent_id: str):
             raise Exception(f"Rate limit error: {e}")
 
     def _validate_token_auth(security_cfg):
-        """Validate header-based token authentication."""
+        """Validate header-based token authentication.
+        Token 认证
+        """
         token_cfg = security_cfg.get("token",{})
         header = token_cfg.get("token_header")
         token_value = token_cfg.get("token_value")
@@ -1975,7 +2137,9 @@ async def webhook(agent_id: str):
             raise Exception("Invalid token authentication")
 
     def _validate_basic_auth(security_cfg):
-        """Validate HTTP Basic Auth credentials."""
+        """Validate HTTP Basic Auth credentials.
+        Basic Auth 认证
+        """
         auth_cfg = security_cfg.get("basic_auth", {})
         username = auth_cfg.get("username")
         password = auth_cfg.get("password")
@@ -1985,7 +2149,9 @@ async def webhook(agent_id: str):
             raise Exception("Invalid Basic Auth credentials")
 
     def _validate_jwt_auth(security_cfg):
-        """Validate JWT token in Authorization header."""
+        """Validate JWT token in Authorization header.
+        JWT 认证
+        """
         jwt_cfg = security_cfg.get("jwt", {})
         secret = jwt_cfg.get("secret")
         if not secret:
@@ -2044,6 +2210,7 @@ async def webhook(agent_id: str):
             if claim in RESERVED_CLAIMS:
                 raise Exception(f"Reserved JWT claim cannot be required: {claim}")
 
+        # 验证自定义 claims
         for claim in required_claims:
             if claim not in decoded:
                 raise Exception(f"Missing JWT claim: {claim}")
@@ -2068,7 +2235,9 @@ async def webhook(agent_id: str):
 
     # 7. Parse request body
     async def parse_webhook_request(content_type):
-        """Parse request based on content-type and return structured data."""
+        """Parse request based on content-type and return structured data.
+        解析 Webhook 请求
+        """
 
         # 1. Query
         query_data = {k: v for k, v in request.args.items()}
@@ -2077,6 +2246,7 @@ async def webhook(agent_id: str):
         header_data = {k: v for k, v in request.headers.items()}
 
         # 3. Body
+        # 根据 Content-Type 解析 Body
         ctype = request.headers.get("Content-Type", "").split(";")[0].strip()
         if ctype and ctype != content_type:
             raise ValueError(
@@ -2101,6 +2271,7 @@ async def webhook(agent_id: str):
 
                 if len(files) > 10:
                     raise Exception("Too many uploaded files")
+                # 处理文件上传
                 for key, file in files.items():
                     desc = FileService.upload_info(
                         cvs.user_id,           # user
@@ -2141,6 +2312,8 @@ async def webhook(agent_id: str):
         Required fields must exist.
         Optional fields default to type-based default values.
         Type validation included.
+
+        Schema 提取与验证
         """
         props = schema.get("properties", {})
         required = schema.get("required", [])
@@ -2151,6 +2324,7 @@ async def webhook(agent_id: str):
             field_type = field_schema.get("type")
 
             # 1. Required field missing
+            # 必填字段检查
             if field in required and field not in data:
                 raise Exception(f"{name} missing required field: {field}")
 
@@ -2163,6 +2337,7 @@ async def webhook(agent_id: str):
 
             # 3. Auto convert value
             try:
+                # 类型转换与验证
                 value = auto_cast_value(raw_value, field_type)
             except Exception as e:
                 raise Exception(f"{name}.{field} auto-cast failed: {str(e)}")
@@ -2332,6 +2507,8 @@ async def webhook(agent_id: str):
 
         REDIS_CONN.set_obj(key, obj, ttl)
 
+    # 执行模式
+    # 立即响应模式（Immediately）
     if execution_mode == "Immediately":
         status = response_cfg.get("status", 200)
         try:
@@ -2362,6 +2539,7 @@ async def webhook(agent_id: str):
             content_type=content_type,
         )
 
+        # 后台异步执行 Agent
         async def background_run():
             try:
                 async for ans in canvas.run(
@@ -2383,6 +2561,8 @@ async def webhook(agent_id: str):
                         }
                     )
 
+                # 处理事件
+                # 更新 DSL
                 cvs.dsl = json.loads(str(canvas))
                 UserCanvasService.update_by_id(cvs.user_id, cvs.to_dict())
 
@@ -2417,6 +2597,7 @@ async def webhook(agent_id: str):
             task.add_done_callback(_background_tasks.discard)
         return resp
     else:
+        # 等待响应模式
         async def sse():
             nonlocal canvas
             contents: list[str] = []
@@ -2493,12 +2674,19 @@ async def webhook(agent_id: str):
 @manager.route("/agents/<agent_id>/webhook/logs", methods=["GET"])  # noqa: F821
 @login_required
 async def webhook_trace(agent_id: str):
+    """
+    获取指定 Agent 的 Webhook 执行日志，支持按时间戳和 Webhook ID 查询。
+    """
     exists, cvs = UserCanvasService.get_by_id(agent_id)
     if not exists or str(cvs.user_id) != str(current_user.id):
         return get_data_error_result(
             message="Canvas not found.",
         )
 
+    # Webhook ID 编解码函数
+    # 1.使用 HMAC-SHA256 对时间戳签名
+    # 2.Base64 URL-safe 编码
+    # 3.生成唯一的 Webhook ID
     def encode_webhook_id(start_ts: str) -> str:
         WEBHOOK_ID_SECRET = "webhook_id_secret"
         sig = hmac.new(
@@ -2508,19 +2696,27 @@ async def webhook_trace(agent_id: str):
         ).digest()
         return base64.urlsafe_b64encode(sig).decode("utf-8").rstrip("=")
 
+    # 解码函数
+    # 1.遍历所有 Webhook 时间戳
+    # 2.重新编码对比，找到匹配的时间戳
     def decode_webhook_id(enc_id: str, webhooks: dict) -> str | None:
         for ts in webhooks.keys():
             if encode_webhook_id(ts) == enc_id:
                 return ts
         return None
-    since_ts = request.args.get("since_ts", type=float)
-    webhook_id = request.args.get("webhook_id")
+    since_ts = request.args.get("since_ts", type=float) # since_ts：起始时间戳，用于增量查询
+    webhook_id = request.args.get("webhook_id") # webhook_id：Webhook 的唯一标识符
 
+    # 从 Redis 读取日志
     key = f"webhook-trace-{agent_id}-logs"
     from rag.utils.redis_conn import REDIS_CONN
 
     raw = REDIS_CONN.get(key)
 
+    # 首次查询（无 webhook_id）
+    # 1.找到 since_ts 之后最早的 Webhook
+    # 2.生成 Webhook ID 并返回
+    # 3.events 为空，客户端需要再次请求获取事件
     if since_ts is None:
         now = time.time()
         return get_json_result(
@@ -2573,6 +2769,12 @@ async def webhook_trace(agent_id: str):
             }
         )
 
+    # 后续查询（有 webhook_id）
+    # 1.解码 webhook_id 获取真实时间戳
+    # 2.获取该 Webhook 的所有事件
+    # 3.过滤出 since_ts 之后的新事件
+    # 4.更新 next_since_ts 为最新事件的时间戳
+    # 5.检查是否完成（有 finished 事件）
     real_id = decode_webhook_id(webhook_id, webhooks)
 
     if not real_id:
@@ -2614,12 +2816,18 @@ async def download_attachment(tenant_id=None, attachment_id=None):
     to the tenant that owns the document's knowledge base. A denial returns the
     same "Document not found!" response so the endpoint cannot be used to
     enumerate doc ids across tenants.
+
+    下载指定 ID 的附件文件，支持不同的文件扩展名和 MIME 类型。
     """
     try:
         # Keep backward compatibility with older callers and unit tests that still
         # pass `attachment_id` instead of the route parameter name.
-        ext = request.args.get("ext", "markdown")
-        data = await thread_pool_exec(settings.STORAGE_IMPL.get, tenant_id, attachment_id)
+        ext = request.args.get("ext", "markdown") # 从查询参数获取文件扩展名
+        data = await thread_pool_exec(settings.STORAGE_IMPL.get, tenant_id, attachment_id) # 从存储获取文件
+        # 构建响应
+        # 1.创建 Flask 响应对象
+        # 2.从映射表获取 MIME 类型
+        # 3.应用安全响应头
         response = await make_response(data)
         content_type = CONTENT_TYPE_MAP.get(ext, f"application/{ext}")
         apply_safe_file_response_headers(response, content_type, ext)

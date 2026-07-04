@@ -619,26 +619,39 @@ def has_canceled(task_id):
 
 
 def queue_dataflow(tenant_id:str, flow_id:str, task_id:str, doc_id:str=CANVAS_DEBUG_DOC_ID, file:dict=None, priority: int=0, rerun:bool=False) -> tuple[bool, str]:
+    """
+    创建一个数据流处理任务，将其放入 Redis 队列，并更新数据库中的任务状态。
+    """
 
+    # 构建任务对象
     task = dict(
-        id=task_id,
-        doc_id=doc_id,
-        from_page=0,
+        id=task_id,                                                                 # id：任务唯一标识符
+        doc_id=doc_id,                                                              # doc_id：要处理的文档 ID
+        from_page=0,                                                                # from_page / to_page：处理页面范围（默认全部）
         to_page=MAXIMUM_TASK_PAGE_NUMBER,
-        task_type="dataflow" if not rerun else "dataflow_rerun",
-        priority=priority,
-        begin_at= datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        task_type="dataflow" if not rerun else "dataflow_rerun",                    # task_type：区分首次处理（dataflow）和重新处理（dataflow_rerun）
+        priority=priority,                                                          # priority：任务优先级                                       
+        begin_at= datetime.now().strftime("%Y-%m-%d %H:%M:%S"),                     # begin_at：任务开始时间
     )
+    #  清理旧任务并更新文档状态
     if doc_id not in [CANVAS_DEBUG_DOC_ID, GRAPH_RAPTOR_FAKE_DOC_ID]:
-        TaskService.model.delete().where(TaskService.model.doc_id == doc_id).execute()
-        DocumentService.begin2parse(doc_id)
+        TaskService.model.delete().where(TaskService.model.doc_id == doc_id).execute() # 删除该文档的所有旧任务
+        DocumentService.begin2parse(doc_id) # 用 begin2parse 标记文档开始解析（更新状态为"处理中"）
+    # 插入任务到数据库
+    # 1.将任务写入数据库
+    # 2.replace_on_conflict=True：如果任务 ID 冲突则替换
     bulk_insert_into_db(model=Task, data_source=[task], replace_on_conflict=True)
 
-    task["kb_id"] = DocumentService.get_knowledgebase_id(doc_id)
-    task["tenant_id"] = tenant_id
-    task["dataflow_id"] = flow_id
-    task["file"] = file
+    # 完善任务对象（用于队列）
+    task["kb_id"] = DocumentService.get_knowledgebase_id(doc_id)   # kb_id：知识库 ID
+    task["tenant_id"] = tenant_id                                  # tenant_id：租户 ID
+    task["dataflow_id"] = flow_id                                  # dataflow_id：数据流 ID
+    task["file"] = file                                            # file：文件信息（可选）
 
+    # 推入 Redis 队列
+    # 使用 get_svr_queue_name 生成队列名称（根据优先级）
+    # 将任务推入 Redis 队列
+    # 失败时返回错误信息
     if not REDIS_CONN.queue_product(
             settings.get_svr_queue_name(priority, "common"), message=task
     ):
