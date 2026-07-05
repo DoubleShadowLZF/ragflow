@@ -93,17 +93,43 @@ def _store_chunk_image_or_error(dataset_id, chunk_id, image_binary):
 
 
 class Chunk(BaseModel):
-    id: str = ""
-    content: str = ""
-    document_id: str = ""
-    docnm_kwd: str = ""
-    important_keywords: list = Field(default_factory=list)
-    tag_kwd: list = Field(default_factory=list)
-    questions: list = Field(default_factory=list)
-    question_tks: str = ""
-    image_id: str = ""
-    available: bool = True
-    positions: list[list[int]] = Field(default_factory=list)
+    """
+    Pydantic 模型，用于分块数据的验证和序列化。它是 RAGFlow 中文档分块（Chunk）的数据结构定义。
+    核心功能：定义文档分块（Chunk）的数据结构，用于 API 请求/响应验证和类型检查。
+
+    数据示例
+    {
+        "id": "chunk_001",
+        "content": "Python是一种高级编程语言，广泛应用于人工智能领域...",
+        "document_id": "doc_001",
+        "docnm_kwd": "Python基础教程",
+        "important_keywords": ["Python", "编程语言", "人工智能"],
+        "tag_kwd": ["技术", "教程"],
+        "questions": ["什么是Python？", "Python的用途有哪些？"],
+        "question_tks": "Python 编程 语言 人工 智能",
+        "image_id": "img_001",
+        "available": true,
+        "positions": [[1, 100], [2, 50]]
+    }
+    """
+    # 基本标识字段
+    id: str = ""            # 分块唯一标识符
+    document_id: str = ""   # 所属文档 ID
+    docnm_kwd: str = ""     # 文档名称关键词
+
+    # 内容字段
+    content: str = ""       # 分块内容
+    question_tks: str = ""  # 问题分词（用于检索）
+
+    # 关键词与标签字段
+    important_keywords: list = Field(default_factory=list)  # 重要关键词列表
+    tag_kwd: list = Field(default_factory=list)             # 标签列表
+    questions: list = Field(default_factory=list)           # 相关问题列表
+
+    # 元数据字段
+    image_id: str = ""                                      # 图片 ID（文档中的图片）
+    available: bool = True                                  # 是否可用
+    positions: list[list[int]] = Field(default_factory=list)# 位置信息（页面/段落位置）
 
     @validator("positions")
     def validate_positions(cls, value):
