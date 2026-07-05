@@ -65,11 +65,18 @@ class MCPToolCallSession(ToolCallSession):
         asyncio.run_coroutine_threadsafe(self._mcp_server_loop(), self._event_loop)
 
     async def _mcp_server_loop(self) -> None:
+        """
+        根据服务器类型建立 MCP 连接，初始化会话，并处理服务器任务。
+        """
+        # 获取服务器 URL 和请求头
         url = self._mcp_server.url.strip()
         raw_headers: dict[str, str] = self._mcp_server.headers or {}
         custom_header: dict[str, str] = self._custom_header or {}
         headers: dict[str, str] = {}
 
+        # 使用 Template.safe_substitute 替换变量（如 ${ENV_VAR}）
+        # 合并服务器配置的 headers 和自定义 headers
+        # 过滤空值
         for h, v in raw_headers.items():
             nh = Template(h).safe_substitute(self._server_variables)
             nv = Template(v).safe_substitute(self._server_variables)
@@ -81,6 +88,11 @@ class MCPToolCallSession(ToolCallSession):
             nv = Template(v).safe_substitute(custom_header)
             headers[nh] = nv
 
+        # SSE 传输模式
+        # 1.使用 sse_client 建立 SSE 连接
+        # 2.创建 MCP ClientSession
+        # 3.5 秒超时初始化
+        # 4.成功则处理任务，失败则记录错误
         if self._mcp_server.server_type == MCPServerType.SSE:
             # SSE transport
             try:
@@ -101,6 +113,10 @@ class MCPToolCallSession(ToolCallSession):
                 msg = "Connection failed (possibly due to auth error). Please check authentication settings first"
                 await self._process_mcp_tasks(None, msg)
 
+        # Streamable HTTP 传输模式
+        # 1.使用 streamablehttp_client 建立 HTTP 流连接
+        # 2.支持双向读写流
+        # 3.其他逻辑与 SSE 模式相同
         elif self._mcp_server.server_type == MCPServerType.STREAMABLE_HTTP:
             # Streamable HTTP transport
             try:
@@ -122,11 +138,21 @@ class MCPToolCallSession(ToolCallSession):
                 msg = "Connection failed (possibly due to auth error). Please check authentication settings first"
                 await self._process_mcp_tasks(None, msg)
 
+        # 不支持的服务器类型
+        # 1.记录不支持的类型
+        # 2.不执行任何操作
         else:
             await self._process_mcp_tasks(None,
                                           f"Unsupported MCP server type: {self._mcp_server.server_type}, id: {self._mcp_server.id}")
 
     async def _process_mcp_tasks(self, client_session: ClientSession | None, error_message: str | None = None) -> None:
+        """
+        从任务队列中获取 MCP 操作请求，执行并返回结果。
+        """
+        # 循环与超时控制
+        # 1.持续运行直到 _close 为 True
+        # 2.每秒检查一次队列，超时则继续循环
+        # 3.被取消时退出循环
         while not self._close:
             try:
                 mcp_task, arguments, result_queue = await asyncio.wait_for(self._queue.get(), timeout=1)
@@ -139,6 +165,10 @@ class MCPToolCallSession(ToolCallSession):
 
             r: Any = None
 
+            # 错误状态处理
+            # 1.如果会话不可用或有错误消息
+            # 2.直接返回错误结果到队列
+            # 3.不执行任何 MCP 操作
             if not client_session or error_message:
                 r = ValueError(error_message)
                 try:
@@ -147,6 +177,11 @@ class MCPToolCallSession(ToolCallSession):
                     break
                 continue
 
+            # 执行 MCP 任务
+            # 1.list_tools：获取服务器提供的工具列表
+            # 2.tool_call：调用指定的工具
+            # 3.未知任务：返回错误
+            # 4.异常捕获并返回异常对象
             try:
                 if mcp_task == "list_tools":
                     r = await client_session.list_tools()

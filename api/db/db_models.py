@@ -1193,14 +1193,22 @@ class UserCanvasVersion(DataBaseModel):
 
 
 class MCPServer(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    name = CharField(max_length=255, null=False, help_text="MCP Server name")
-    tenant_id = CharField(max_length=32, null=False, index=True)
-    url = CharField(max_length=2048, null=False, help_text="MCP Server URL")
-    server_type = CharField(max_length=32, null=False, help_text="MCP Server type")
-    description = TextField(null=True, help_text="MCP Server description")
-    variables = JSONField(null=True, default=dict, help_text="MCP Server variables")
-    headers = JSONField(null=True, default=dict, help_text="MCP Server additional request headers")
+    """
+    存储 MCP 服务器的配置，包括连接信息、认证凭证、变量和请求头。
+    """
+    # 基本标识字段
+    id = CharField(max_length=32, primary_key=True)                                                     # 主键，MCP 服务器的唯一标识符
+    name = CharField(max_length=255, null=False, help_text="MCP Server name")                           # 名称，MCP 服务器的显示名称
+    tenant_id = CharField(max_length=32, null=False, index=True)                                        # 租户 ID，实现多租户隔离
+    description = TextField(null=True, help_text="MCP Server description")                              # 描述，服务器的详细说明
+
+    # 连接配置字段
+    url = CharField(max_length=2048, null=False, help_text="MCP Server URL")                            # 服务器 URL，MCP 服务器的端点地址
+    server_type = CharField(max_length=32, null=False, help_text="MCP Server type")                     # 服务器类型，如 stdio、sse、http 等
+
+    # 认证与扩展字段
+    variables = JSONField(null=True, default=dict, help_text="MCP Server variables")                    # 变量，用于模板替换或环境变量
+    headers = JSONField(null=True, default=dict, help_text="MCP Server additional request headers")     # 请求头，自定义 HTTP 请求头
 
     class Meta:
         db_table = "mcp_server"
