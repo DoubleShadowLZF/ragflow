@@ -762,9 +762,47 @@ class DocMetadataService:
 
         Returns:
             Metadata dictionary in format: {field_name: {value: [doc_ids]}}
+
+        从向量数据库中查询指定知识库的所有文档元数据，经过扁平化处理后，生成 {字段名: {值: [文档ID列表]}} 格式的字典。
+
+        原始文档数据
+        [
+            {
+                "id": "doc_001",
+                "kb_id": "kb_001",
+                "meta_fields": "{\"tags\": [\"AI\", \"ML\"], \"author\": \"张三\", \"year\": 2024}"
+            },
+            {
+                "id": "doc_002",
+                "kb_id": "kb_001",
+                "meta_fields": "{\"tags\": [\"ML\", \"NLP\"], \"author\": \"李四\", \"year\": 2023}"
+            }
+        ]
+
+        提取的元数据
+        doc_meta_1 = {"tags": ["AI", "ML"], "author": "张三", "year": 2024}
+        doc_meta_2 = {"tags": ["ML", "NLP"], "author": "李四", "year": 2023}
+
+        扁平化后的结果
+        {
+            "tags": {
+                "AI": ["doc_001"],
+                "ML": ["doc_001", "doc_002"],
+                "NLP": ["doc_002"]
+            },
+            "author": {
+                "张三": ["doc_001"],
+                "李四": ["doc_002"]
+            },
+            "year": {
+                "2024": ["doc_001"],
+                "2023": ["doc_002"]
+            }
+        }
         """
         try:
             # Get tenant_id from first KB
+            # 获取租户 ID 和索引名称
             kb = Knowledgebase.get_by_id(kb_ids[0])
             if not kb:
                 return {}
@@ -772,6 +810,7 @@ class DocMetadataService:
             tenant_id = kb.tenant_id
             index_name = cls._get_doc_meta_index_name(tenant_id)
 
+            # 批量查询文档元数据
             condition = {"kb_id": kb_ids}
             order_by = OrderByExpr()
 
@@ -792,15 +831,22 @@ class DocMetadataService:
             logging.debug(f"[get_flatted_meta_by_kbs] results type: {type(results)}")
 
             # Aggregate metadata
+            # 迭代处理查询结果
             meta = {}
             doc_count = 0
 
             # Use helper to iterate over results in any format
+            # 统一处理不同数据源的返回格式
             for doc_id, doc in cls._iter_search_results(results):
                 doc_count += 1
                 # Extract metadata fields (exclude system fields)
+                # 从文档中提取元数据字段
                 doc_meta = cls._extract_metadata(doc)
 
+                # 核心：扁平化处理
+                # 1.遍历文档的每个元数据字段
+                # 2.如果值是列表，展开为多个条目
+                # 3.构建倒排索引：字段名 → 值 → [文档ID列表]
                 for k, v in doc_meta.items():
                     if k not in meta:
                         meta[k] = {}
@@ -814,6 +860,9 @@ class DocMetadataService:
                             meta[k][sv] = []
                         meta[k][sv].append(doc_id)
 
+            # 数据截断警告
+            # 1.如果文档数量达到限制，记录警告
+            # 2.数据可能不完整
             if doc_count >= 10000:
                 logging.warning(f"[get_flatted_meta_by_kbs] Results hit the 10000 limit for KBs {kb_ids}.")
 

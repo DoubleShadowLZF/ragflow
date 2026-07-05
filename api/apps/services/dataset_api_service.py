@@ -60,12 +60,19 @@ async def create_dataset(tenant_id: str, req: dict):
     :param tenant_id: tenant ID
     :param req: dataset creation request
     :return: (success, result) or (success, error_message)
+
+    处理知识库创建请求，包括参数映射、配置解析器、验证模型、保存数据。
     """
     # Extract ext field for additional parameters
+    # 参数提取与预处理
     ext_fields = req.pop("ext", {})
 
     # Map auto_metadata_config (if provided) into parser_config structure
     auto_meta = req.pop("auto_metadata_config", {})
+    # 配置自动元数据
+    # 1.从 auto_metadata_config 提取元数据字段配置
+    # 2.转换为 parser_config 中的 metadata 结构
+    # 3.包括字段名、类型、描述、示例、是否限制值
     if auto_meta:
         parser_cfg = req.get("parser_config") or {}
         fields = []
@@ -84,27 +91,40 @@ async def create_dataset(tenant_id: str, req: dict):
         req["parser_config"] = parser_cfg
     req.update(ext_fields)
 
+    # 创建知识库
+    # 调用 create_with_name 创建知识库
     e, create_dict = KnowledgebaseService.create_with_name(name=req.pop("name", None), tenant_id=tenant_id, parser_id=req.pop("parser_id", None), **req)
 
     if not e:
         return False, create_dict
 
     # Insert embedding model(embd id)
+    # 处理 Embedding 模型
     ok, t = TenantService.get_by_id(tenant_id)
+    # 检查租户是否存在
     if not ok:
         return False, "Tenant not found"
+    # 如果没有指定 Embedding 模型，使用租户默认模型
     if not create_dict.get("embd_id"):
         create_dict["embd_id"] = t.embd_id
     else:
+        # 如果指定了模型，验证其可用性
         ok, err = verify_embedding_availability(create_dict["embd_id"], tenant_id)
         if not ok:
             return False, err
 
+    # 保存知识库
+    # 保存知识库到数据库
     if not KnowledgebaseService.save(**create_dict):
         return False, "Failed to save dataset"
+    # 获取保存后的知识库对象
     ok, k = KnowledgebaseService.get_by_id(create_dict["id"])
     if not ok:
         return False, "Dataset created failed"
+    # 格式化响应
+    # 1.将知识库对象转换为字典
+    # 2.重映射键名（API 友好）
+    # 3.返回成功和响应数据
     response_data = remap_dictionary_keys(k.to_dict())
     return True, response_data
 
@@ -194,6 +214,8 @@ def get_dataset(dataset_id: str, tenant_id: str):
     :param dataset_id: dataset ID
     :param tenant_id: tenant ID
     :return: (success, result) or (success, error_message)
+
+    获取指定知识库的详细信息，包括元数据、文档大小和连接器列表。
     """
     if not dataset_id:
         return False, 'Lack of "Dataset ID"'
@@ -201,12 +223,19 @@ def get_dataset(dataset_id: str, tenant_id: str):
     if not KnowledgebaseService.accessible(dataset_id, tenant_id):
         return False, f"User '{tenant_id}' lacks permission for dataset '{dataset_id}'"
 
+    # 获取知识库信息
     ok, kb = KnowledgebaseService.get_by_id(dataset_id)
     if not ok:
         return False, "Invalid Dataset ID"
 
+    # 构建响应数据
+    # 1.将知识库对象转换为字典
+    # 2.重映射键名（API 友好）
     response_data = remap_dictionary_keys(kb.to_dict())
+    # 补充额外信息
+    # size：知识库中所有文档的总大小（字节）
     response_data["size"] = DocumentService.get_total_size_by_kb_id(dataset_id)
+    # connectors：关联的数据源连接器列表
     response_data["connectors"] = list(Connector2KbService.list_connectors(dataset_id))
     return True, response_data
 
@@ -246,6 +275,8 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
     :param dataset_id: dataset ID
     :param req: dataset update request
     :return: (success, result) or (success, error_message)
+
+    更新知识库的配置信息，支持元数据配置、解析器参数、模型切换、PageRank 调整等。
     """
     if not req:
         return False, "No properties were modified"
@@ -259,6 +290,7 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
 
     # Map auto_metadata_config into parser_config if present
     auto_meta = req.pop("auto_metadata_config", {})
+    # 配置自动元数据:将 auto_metadata_config 转换为 parser_config.metadata
     if auto_meta:
         parser_cfg = req.get("parser_config") or {}
         fields = []
@@ -277,6 +309,7 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
         req["parser_config"] = parser_cfg
 
     # Merge ext fields with req
+    # 合并额外参数
     req.update(ext_fields)
 
     # Extract connectors from request
@@ -285,6 +318,9 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
         connectors = req["connectors"]
         del req["connectors"]
 
+    # 处理解析器配置
+    # 1.父子文档配置：展开 parent_child 配置
+    # 2.配置合并：使用 deep_merge 合并新配置与现有配置
     if req.get("parser_config"):
         # Flatten parent_child config into children_delimiter for the execution layer
         pc = req["parser_config"].get("parent_child", {})
@@ -301,21 +337,29 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
         parser_config.update(req_ext_fields)
         req["parser_config"] = deep_merge(kb.parser_config, parser_config)
 
+    # 处理解析器切换
+    # 1.切换解析器时，获取新解析器的默认配置
+    # 2.空配置时删除该字段
     if (chunk_method := req.get("parser_id")) and chunk_method != kb.parser_id:
         if not req.get("parser_config"):
             req["parser_config"] = get_parser_config(chunk_method, None)
     elif "parser_config" in req and not req["parser_config"]:
         del req["parser_config"]
 
+    # 清理旧 Pipeline:切换到 parser_id 模式时，清除旧的 pipeline_id
     if kb.pipeline_id and req.get("parser_id") and not req.get("pipeline_id"):
         # shift to use parser_id, delete old pipeline_id
         req["pipeline_id"] = ""
 
+    # 名称唯一性校验
     if "name" in req and req["name"].lower() != kb.name.lower():
         exists = KnowledgebaseService.get_or_none(name=req["name"], tenant_id=tenant_id, status=StatusEnum.VALID.value)
         if exists:
             return False, f"Dataset name '{req['name']}' already exists"
 
+    # 验证 Embedding 模型
+    # 1.空值使用原模型
+    # 2.验证新模型的可用性
     if "embd_id" in req:
         if not req["embd_id"]:
             req["embd_id"] = kb.embd_id
@@ -323,6 +367,10 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
         if not ok:
             return False, err
 
+    # 处理 PageRank
+    # 1.Infinity 引擎不支持 PageRank
+    # 2.PageRank 值 > 0：设置字段
+    # 3.PageRank 值 <= 0：删除字段
     if "pagerank" in req and req["pagerank"] != kb.pagerank:
         if os.environ.get("DOC_ENGINE", "elasticsearch") == "infinity":
             return False, "'pagerank' can only be set when doc_engine is elasticsearch"
@@ -330,15 +378,18 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
         if req["pagerank"] > 0:
             from rag.nlp import search
 
+            # PageRank > 0：设置字段
             settings.docStoreConn.update({"kb_id": kb.id}, {PAGERANK_FLD: req["pagerank"]}, search.index_name(kb.tenant_id), kb.id)
         else:
             # Elasticsearch requires PAGERANK_FLD be non-zero!
             from rag.nlp import search
 
+            # PageRank <= 0：删除字段（Elasticsearch 要求非零值）
             settings.docStoreConn.update({"exists": PAGERANK_FLD}, {"remove": PAGERANK_FLD}, search.index_name(kb.tenant_id), kb.id)
     if "parse_type" in req:
         del req["parse_type"]
 
+    # 保存更新
     if not KnowledgebaseService.update_by_id(kb.id, req):
         return False, "Update dataset error.(Database error)"
 
@@ -347,6 +398,9 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
         return False, "Dataset updated failed"
 
     # Link connectors to the dataset
+    # 关联连接器
+    # 1.将数据源连接器关联到知识库
+    # 2.错误仅记录日志，不阻断更新
     errors = Connector2KbService.link_connectors(kb.id, [conn for conn in connectors], tenant_id)
     if errors:
         logging.error("Link KB errors: %s", errors)
@@ -480,10 +534,14 @@ def run_index(dataset_id: str, tenant_id: str, index_type: str):
     :param tenant_id: tenant ID
     :param index_type: one of "graph", "raptor", "mindmap"
     :return: (success, result) or (success, error_message)
+
+    验证索引类型、检查任务状态、创建索引构建任务并返回任务 ID。
     """
+    # 索引类型验证
     if index_type not in _VALID_INDEX_TYPES:
         return False, f"Invalid index type '{index_type}'. Must be one of {sorted(_VALID_INDEX_TYPES)}"
 
+    # 权限与存在性校验
     if not dataset_id:
         return False, 'Lack of "Dataset ID"'
     if not KnowledgebaseService.accessible(dataset_id, tenant_id):
@@ -493,6 +551,7 @@ def run_index(dataset_id: str, tenant_id: str, index_type: str):
     if not ok:
         return False, "Invalid Dataset ID"
 
+    # 任务状态检查
     task_type = _INDEX_TYPE_TO_TASK_TYPE[index_type]
     task_id_field = _INDEX_TYPE_TO_TASK_ID_FIELD[index_type]
     display_name = _INDEX_TYPE_TO_DISPLAY_NAME[index_type]
@@ -506,6 +565,7 @@ def run_index(dataset_id: str, tenant_id: str, index_type: str):
         if task and task.progress not in [-1, 1]:
             return False, f"Task {existing_task_id} in progress with status {task.progress}. A {display_name} Task is already running."
 
+    # 获取文档列表
     documents, _ = DocumentService.get_by_kb_id(
         kb_id=dataset_id,
         page_number=0,
@@ -517,14 +577,18 @@ def run_index(dataset_id: str, tenant_id: str, index_type: str):
         types=[],
         suffix=[],
     )
+    # 如果知识库为空，无法构建索引
     if not documents:
         return False, f"No documents in Dataset {dataset_id}"
 
+    # 创建索引构建任务
     sample_document = documents[0]
     document_ids = [document["id"] for document in documents]
 
+    # 调用 queue_raptor_o_graphrag_tasks 创建任务
     task_id = queue_raptor_o_graphrag_tasks(sample_doc=sample_document, ty=task_type, priority=0, fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID, doc_ids=list(document_ids))
 
+    # 更新知识库任务 ID
     if not KnowledgebaseService.update_by_id(kb.id, {task_id_field: task_id}):
         logging.warning(f"Cannot save {task_id_field} for Dataset {dataset_id}")
 
@@ -593,6 +657,16 @@ def aggregate_tags(dataset_ids: list[str], tenant_id: str):
     :param dataset_ids: list of dataset IDs
     :param tenant_id: tenant ID
     :return: (success, result) or (success, error_message)
+
+    聚合多个数据集（知识库）的标签信息
+
+    最终返回
+    [
+        {"value": "技术", "count": 18},
+        {"value": "管理", "count": 5},
+        {"value": "客服", "count": 3},
+        {"value": "生产", "count": 6}
+    ]
     """
     if not dataset_ids:
         return False, 'Lack of "dataset_ids"'
@@ -601,6 +675,10 @@ def aggregate_tags(dataset_ids: list[str], tenant_id: str):
         if not KnowledgebaseService.accessible(dataset_id, tenant_id):
             return False, f"No authorization for dataset '{dataset_id}'"
 
+    # 按租户分组
+    # 1.获取每个数据集的详细信息
+    # 2.按租户 ID 分组
+    # 3.无效 ID 时返回错误
     dataset_ids_by_tenant = {}
     for dataset_id in dataset_ids:
         ok, kb = KnowledgebaseService.get_by_id(dataset_id)
@@ -608,6 +686,10 @@ def aggregate_tags(dataset_ids: list[str], tenant_id: str):
             return False, f"Invalid Dataset ID '{dataset_id}'"
         dataset_ids_by_tenant.setdefault(kb.tenant_id, []).append(dataset_id)
 
+    # 聚合标签
+    # 1.遍历每个租户
+    # 2.调用 settings.retriever.all_tags 获取该租户下指定数据集的标签
+    # 3.合并标签计数
     merged = {}
     for kb_tenant_id, kb_ids in dataset_ids_by_tenant.items():
         for tag, count in settings.retriever.all_tags(kb_tenant_id, kb_ids):
@@ -801,6 +883,8 @@ def delete_index(dataset_id: str, tenant_id: str, index_type: str, wipe: bool = 
         phase-completion markers are cleared.  Pass False to cancel the
         running task while keeping prior progress so it can be resumed.
     :return: (success, result) or (success, error_message)
+
+    取消索引构建任务，可选择清除已生成的索引数据（GraphRAG 图谱、RAPTOR 摘要等）。
     """
     if index_type not in _VALID_INDEX_TYPES:
         return False, f"Invalid index type '{index_type}'. Must be one of {sorted(_VALID_INDEX_TYPES)}"
@@ -821,29 +905,45 @@ def delete_index(dataset_id: str, tenant_id: str, index_type: str, wipe: bool = 
 
     logging.info("delete_index: dataset=%s index_type=%s wipe=%s", dataset_id, index_type, wipe)
 
+    # 取消正在运行的任务:消费者检测到取消标记时会停止执行
     if task_id:
         from rag.utils.redis_conn import REDIS_CONN
 
         try:
+            # 在 Redis 中设置取消标记（{task_id}-cancel）
             REDIS_CONN.set(f"{task_id}-cancel", "x")
         except Exception as e:
             logging.exception(e)
+        # 从数据库中删除任务记录
         TaskService.delete_by_id(task_id)
 
+    # 清除索引数据（wipe=True）
     if wipe and index_type == "graph":
         from rag.nlp import search
         from rag.graphrag.phase_markers import clear_phase_markers
+        # 删除知识图谱相关的所有数据：
+        # graph：图谱结构
+        # subgraph：子图
+        # entity：实体
+        # relation：关系
+        # community_report：社区报告
         settings.docStoreConn.delete({"knowledge_graph_kwd": ["graph", "subgraph", "entity", "relation", "community_report"]},
                                      search.index_name(kb.tenant_id), dataset_id)
         # Wiping the graph invalidates any phase-completion markers used to
         # short-circuit resolution / community detection on resume.
+        # 清除阶段完成标记（phase markers）
         clear_phase_markers(dataset_id)
         logging.info("delete_index: cleared GraphRAG artefacts and phase markers for dataset=%s", dataset_id)
+    # RAPTOR 索引清理
     elif wipe and index_type == "raptor":
         from rag.nlp import search
 
+        # 删除 RAPTOR 相关的所有数据
         settings.docStoreConn.delete({"raptor_kwd": ["raptor"]}, search.index_name(kb.tenant_id), dataset_id)
 
+    # 重置知识库字段
+    # 清空任务 ID 和完成时间字段
+    # 知识库可以接受新的索引构建任务
     KnowledgebaseService.update_by_id(kb.id, {task_id_field: "", task_finish_at_field: None})
     return True, {}
 
@@ -855,6 +955,8 @@ def run_embedding(dataset_id: str, tenant_id: str):
     :param dataset_id: dataset ID
     :param tenant_id: tenant ID
     :return: (success, result) or (success, error_message)
+
+    触发知识库中所有文档的向量化处理，生成 Embedding 向量并存入向量数据库。
     """
     if not dataset_id:
         return False, 'Lack of "Dataset ID"'
@@ -880,9 +982,13 @@ def run_embedding(dataset_id: str, tenant_id: str):
     if not documents:
         return False, f"No documents in Dataset {dataset_id}"
 
+    # 触发文档处理
+    # 初始化 kb_table_num_map（用于追踪文档数量）
     kb_table_num_map = {}
+    # 遍历每个文档，添加租户 ID
     for doc in documents:
         doc["tenant_id"] = tenant_id
+        # 调用 DocumentService.run 触发文档处理（解析 + 向量化）
         DocumentService.run(tenant_id, doc, kb_table_num_map)
 
     return True, {"scheduled_count": len(documents)}

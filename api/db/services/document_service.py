@@ -1068,16 +1068,24 @@ def queue_raptor_o_graphrag_tasks(sample_doc, ty, priority, fake_doc_id="", doc_
     """
     You can provide a fake_doc_id to bypass the restriction of tasks at the knowledgebase level.
     Optionally, specify a list of doc_ids to determine which documents participate in the task.
+
+    创建索引构建任务，生成唯一标识（digest），保存到数据库，并推入 Redis 队列。
     """
+    # 参数校验
     if doc_ids is None:
         doc_ids = []
     assert ty in ["graphrag", "raptor", "mindmap"], "type should be graphrag, raptor or mindmap"
 
+    # 获取分块配置并计算哈希
+    # 获取样本文档的分块配置
     chunking_config = DocumentService.get_chunking_config(sample_doc["id"])
+    # 使用 xxhash.xxh64 计算哈希值
     hasher = xxhash.xxh64()
+    # 按字段名排序确保一致性
     for field in sorted(chunking_config.keys()):
         hasher.update(str(chunking_config[field]).encode("utf-8"))
 
+    # 创建任务对象
     def new_task():
         return {
             "id": get_uuid(),
@@ -1090,14 +1098,23 @@ def queue_raptor_o_graphrag_tasks(sample_doc, ty, priority, fake_doc_id="", doc_
         }
 
     task = new_task()
+    # 计算任务摘要（Digest）
     for field in ["doc_id", "from_page", "to_page"]:
+        # 将任务的关键字段加入哈希计算
         hasher.update(str(task.get(field, "")).encode("utf-8"))
+    # 生成唯一的摘要值
     hasher.update(ty.encode("utf-8"))
     task["digest"] = hasher.hexdigest()
+    # 保存任务到数据库
+    # replace_on_conflict=True：冲突时替换
     bulk_insert_into_db(Task, [task], True)
 
+    # 更新文档状态并推入队列
+    # 将文档 ID 列表添加到任务对象（用于队列）
     task["doc_ids"] = doc_ids
+    # 将文档 ID 列表添加到任务对象（用于队列）
     DocumentService.begin2parse(task["doc_id"], keep_progress=True)
+    # 将任务推入 Redis 队列
     assert REDIS_CONN.queue_product(settings.get_svr_queue_name(priority, ty), message=task), "Can't access Redis. Please check the Redis' status."
     return task["id"]
 

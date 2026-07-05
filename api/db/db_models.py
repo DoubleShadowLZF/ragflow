@@ -865,35 +865,52 @@ class TenantLangfuse(DataBaseModel):
 
 
 class Knowledgebase(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    avatar = TextField(null=True, help_text="avatar base64 string")
-    tenant_id = CharField(max_length=32, null=False, index=True)
-    name = CharField(max_length=128, null=False, help_text="KB name", index=True)
-    language = CharField(max_length=32, null=True, default="Chinese" if "zh_CN" in os.getenv("LANG", "") else "English", help_text="English|Chinese", index=True)
-    description = TextField(null=True, help_text="KB description")
-    embd_id = CharField(max_length=128, null=False, help_text="default embedding model ID", index=True)
-    tenant_embd_id = IntegerField(null=True, help_text="id in tenant_llm", index=True)
-    permission = CharField(max_length=16, null=False, help_text="me|team", default="me", index=True)
-    created_by = CharField(max_length=32, null=False, index=True)
-    doc_num = IntegerField(default=0, index=True)
-    token_num = IntegerField(default=0, index=True)
-    chunk_num = IntegerField(default=0, index=True)
-    similarity_threshold = FloatField(default=0.2, index=True)
-    vector_similarity_weight = FloatField(default=0.3, index=True)
+    """
+    RAGFlow 中 知识库（Knowledge Base）的核心数据模型。知识库是 RAG 系统的核心概念，用于组织和管理文档、向量数据以及相关的处理配置。
+    核心功能：存储知识库的所有配置信息，包括基本信息、模型配置、解析参数、统计数据和任务状态。
+    """
 
-    parser_id = CharField(max_length=32, null=False, help_text="default parser ID", default=ParserType.NAIVE.value, index=True)
-    pipeline_id = CharField(max_length=32, null=True, help_text="Pipeline ID", index=True)
-    parser_config = JSONField(null=False, default={"pages": [[1, 1000000]], "table_context_size": 0, "image_context_size": 0})
-    pagerank = IntegerField(default=0, index=False)
 
-    graphrag_task_id = CharField(max_length=32, null=True, help_text="Graph RAG task ID", index=True)
-    graphrag_task_finish_at = DateTimeField(null=True)
-    raptor_task_id = CharField(max_length=32, null=True, help_text="RAPTOR task ID", index=True)
-    raptor_task_finish_at = DateTimeField(null=True)
-    mindmap_task_id = CharField(max_length=32, null=True, help_text="Mindmap task ID", index=True)
-    mindmap_task_finish_at = DateTimeField(null=True)
+    # 基本信息字段
+    id = CharField(max_length=32, primary_key=True) # 主键，知识库的唯一标识符
+    tenant_id = CharField(max_length=32, null=False, index=True) # 租户 ID，实现多租户隔离
+    name = CharField(max_length=128, null=False, help_text="KB name", index=True)  # 知识库名称，租户内唯一
+    avatar = TextField(null=True, help_text="avatar base64 string") # 头像，Base64 编码的图片
+    description = TextField(null=True, help_text="KB description") # 描述，知识库的详细说明
+    language = CharField(max_length=32, null=True, default="Chinese" if "zh_CN" in os.getenv("LANG", "") else "English", help_text="English|Chinese", index=True) # 语言，自动检测系统语言
 
-    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
+    # 模型配置字段
+    embd_id = CharField(max_length=128, null=False, help_text="default embedding model ID", index=True) # Embedding 模型 ID，用于向量化
+    tenant_embd_id = IntegerField(null=True, help_text="id in tenant_llm", index=True) # 租户 Embedding ID，在 tenant_llm 表中的 ID
+
+    # 权限与状态字段
+    permission = CharField(max_length=16, null=False, help_text="me|team", default="me", index=True) # 权限级别：me（私有）/ team（团队共享）
+    created_by = CharField(max_length=32, null=False, index=True) # 创建者 ID
+    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True) # 状态：0（已废弃）/ 1（有效）
+
+    # 统计字段
+    doc_num = IntegerField(default=0, index=True) # 文档数量
+    token_num = IntegerField(default=0, index=True) # Token 总量，用于计费
+    chunk_num = IntegerField(default=0, index=True) # 分块数量
+    pagerank = IntegerField(default=0, index=False) # PageRank 值，用于排序
+
+    # 检索参数字段
+    similarity_threshold = FloatField(default=0.2, index=True) # 相似度阈值，过滤低相关度结果
+    vector_similarity_weight = FloatField(default=0.3, index=True) # 向量相似度权重，混合检索中向量的权重
+
+    # 解析配置字段
+    parser_id = CharField(max_length=32, null=False, help_text="default parser ID", default=ParserType.NAIVE.value, index=True) # 解析器类型：naive、knowledge_graph、table 等
+    pipeline_id = CharField(max_length=32, null=True, help_text="Pipeline ID", index=True) # 管道 ID，关联 DataFlow 管道
+    parser_config = JSONField(null=False, default={"pages": [[1, 1000000]], "table_context_size": 0, "image_context_size": 0}) # 解析器配置，如页面范围、上下文大小等
+
+    # 异步任务字段
+    graphrag_task_id = CharField(max_length=32, null=True, help_text="Graph RAG task ID", index=True) # GraphRAG 任务 ID
+    graphrag_task_finish_at = DateTimeField(null=True) # GraphRAG 任务完成时间
+    raptor_task_id = CharField(max_length=32, null=True, help_text="RAPTOR task ID", index=True) # RAPTOR 任务 ID
+    raptor_task_finish_at = DateTimeField(null=True) # RAPTOR 任务完成时间
+    mindmap_task_id = CharField(max_length=32, null=True, help_text="Mindmap task ID", index=True) # 思维导图任务 ID
+    mindmap_task_finish_at = DateTimeField(null=True) # 思维导图任务完成时间
+
 
     def __str__(self):
         return self.name
@@ -1190,42 +1207,55 @@ class MCPServer(DataBaseModel):
 
 
 class Search(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    avatar = TextField(null=True, help_text="avatar base64 string")
-    tenant_id = CharField(max_length=32, null=False, index=True)
-    name = CharField(max_length=128, null=False, help_text="Search name", index=True)
-    description = TextField(null=True, help_text="KB description")
-    created_by = CharField(max_length=32, null=False, index=True)
+    """
+    存储搜索配置模板，包括知识库选择、检索参数、重排序设置、LLM 参数等。
+    """
+    # 基本信息字段
+    id = CharField(max_length=32, primary_key=True) # 主键，搜索配置的唯一标识符
+    avatar = TextField(null=True, help_text="avatar base64 string") # 头像，Base64 编码的图片
+    tenant_id = CharField(max_length=32, null=False, index=True) # 租户 ID，实现多租户隔离
+    name = CharField(max_length=128, null=False, help_text="Search name", index=True) # 配置名称，用于标识不同的搜索配置
+    description = TextField(null=True, help_text="KB description") # 描述，配置的详细说明
+    created_by = CharField(max_length=32, null=False, index=True) # 创建者 ID
+
+    # 搜索配置字段
     search_config = JSONField(
         null=False,
         default={
-            "kb_ids": [],
-            "doc_ids": [],
-            "similarity_threshold": 0.2,
-            "vector_similarity_weight": 0.3,
-            "use_kg": False,
+            # 数据源
+            "kb_ids": [], # 知识库 ID 列表
+            "doc_ids": [], # 文档 ID 列表（可选）
+
+            # 检索参数
+            "similarity_threshold": 0.2, # 相似度阈值，用于过滤掉相似度低于阈值的结果
+            "vector_similarity_weight": 0.3, # 向量相似度权重，用于计算向量相似度
+            "use_kg": False, # 是否使用知识图谱
+
             # rerank settings
-            "rerank_id": "",
-            "top_k": 1024,
+            "rerank_id": "", #  重排序模型 ID
+            "top_k": 1024, # 最大召回数
+
             # chat settings
-            "summary": False,
-            "chat_id": "",
+            "summary": False, # 是否使用摘要
+            "chat_id": "", # 聊天模型 ID
             # Leave it here for reference, don't need to set default values
-            "llm_setting": {
+            "llm_setting": { # LLM 参数
                 # "temperature": 0.1,
                 # "top_p": 0.3,
                 # "frequency_penalty": 0.7,
                 # "presence_penalty": 0.4,
             },
-            "chat_settingcross_languages": [],
-            "highlight": False,
-            "keyword": False,
-            "web_search": False,
-            "related_search": False,
-            "query_mindmap": False,
+            "chat_settingcross_languages": [], # 语言
+            "highlight": False, # 是否使用高亮
+            "keyword": False, # 是否使用关键词
+            "web_search": False, # 是否使用 Web 搜索
+            "related_search": False, # 是否使用相关搜索
+            "query_mindmap": False, # 是否使用思维导图
         },
     )
-    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
+
+    # 状态字段
+    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True) # 状态：0（已废弃）/ 1（有效）
 
     def __str__(self):
         return self.name

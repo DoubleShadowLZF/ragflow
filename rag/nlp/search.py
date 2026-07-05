@@ -839,9 +839,22 @@ class Dealer:
         return res
 
     def all_tags(self, tenant_id: str, kb_ids: list[str], S=1000):
+        # 检查索引是否存在
         if not self.dataStore.index_exist(index_name(tenant_id), kb_ids[0]):
             return []
-        res = self.dataStore.search([], [], {}, [], OrderByExpr(), 0, 0, index_name(tenant_id), kb_ids, ["tag_kwd"])
+        # 执行搜索查询
+        res = self.dataStore.search(
+            [],  # select_fields: 不返回字段内容
+            [],  # highlight_fields: 不高亮
+            {},  # condition: 无过滤条件
+            [],  # match_expressions: 无匹配表达式
+            OrderByExpr(),  # order_by: 无排序
+            0, 0,  # offset=0, limit=0（只取聚合结果）
+            index_name(tenant_id),  # index_names: 租户索引
+            kb_ids,  # knowledgebase_ids: 指定的知识库
+            ["tag_kwd"]  # agg_fields: 按 tag_kwd 字段聚合
+        )
+        # 获取聚合结果,返回格式：{标签名: 出现次数}
         return self.dataStore.get_aggregation(res, "tag_kwd")
 
     def all_tags_in_portion(self, tenant_id: str, kb_ids: list[str], S=1000):

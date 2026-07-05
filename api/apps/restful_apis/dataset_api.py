@@ -38,6 +38,9 @@ from api.apps.services import dataset_api_service
 @login_required
 @add_tenant_id_to_kwargs
 def aggregate_tags(tenant_id):
+    """
+    聚合多个知识库中的标签信息，返回标签的统计分布。
+    """
     dataset_ids = request.args.get("dataset_ids", "").split(",")
     dataset_ids = [d for d in dataset_ids if d]
     if not dataset_ids:
@@ -60,6 +63,9 @@ def aggregate_tags(tenant_id):
 @login_required
 @add_tenant_id_to_kwargs
 def get_flattened_metadata(tenant_id):
+    """
+    获取多个知识库中所有文档的扁平化元数据，便于前端进行元数据过滤和展示。
+    """
     dataset_ids = request.args.get("dataset_ids", "").split(",")
     dataset_ids = [d for d in dataset_ids if d]
     if not dataset_ids:
@@ -544,6 +550,8 @@ async def get_knowledge_graph(tenant_id, dataset_id):
     Query params: optional filter params.
     Success: {"code": 0, "data": {...}}
     Errors: AUTHENTICATION_ERROR for access denied; DATA_ERROR for internal errors.
+
+    获取指定知识库的知识图谱，包括实体、关系等图谱数据
     """
     try:
         success, result = await dataset_api_service.get_knowledge_graph(dataset_id, tenant_id)
@@ -560,6 +568,9 @@ async def get_knowledge_graph(tenant_id, dataset_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def run_index(tenant_id, dataset_id):
+    """
+    触发指定知识库的索引构建任务，包括 GraphRAG、RAPTOR、思维导图等。
+    """
     index_type = request.args.get("type", "")
     index_type = index_type.lower()
     try:
