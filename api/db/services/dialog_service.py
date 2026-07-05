@@ -539,9 +539,25 @@ def repair_bad_citation_formats(answer: str, kbinfos: dict, idx: set):
 
 
 async def async_chat(dialog, messages, stream=True, **kwargs):
+    """
+    对话系统的核心引擎，负责处理对话请求、检索知识、生成回答。这是整个 RAG 流程的完整实现。
+
+    RAGFlow 对话系统的核心引擎，它：
+    1.多层检索：SQL + 向量 + 全文 + 知识图谱 + 网络搜索
+    2，查询增强：精炼、翻译、关键词提取
+    3.流式响应：支持流式和非流式
+    4.引用系统：自动插入引用标记
+    5.多模态支持：文本 + 图片
+    6.性能监控：各阶段耗时追踪
+    7.可观测性：Langfuse 集成
+
+    这个函数是 RAGFlow 最核心的代码，实现了完整的 RAG 流程。
+    """
     logging.debug("Begin async_chat")
+    # 确保最后一条消息来自用户
     assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
     session_id = kwargs.get("session_id")
+    # 网络搜索判断:判断是否启用网络搜索
     use_web_search = _should_use_web_search(dialog.prompt_config, kwargs.get("internet"))
     logging.debug("web_search kb=%s tavily=%s internet=%r enabled=%s", bool(dialog.kb_ids), bool(dialog.prompt_config.get("tavily_api_key")), kwargs.get("internet"), use_web_search)
     if not dialog.kb_ids and not use_web_search:
@@ -550,6 +566,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         return
 
     chat_start_ts = timer()
+    # 模型初始化
+    # 1.获取 LLM 模型配置
+    # 2.初始化 Chat、Embedding、Rerank、TTS 模型
     if dialog.llm_id:
         llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
         if "image2text" in llm_types:
@@ -567,6 +586,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     langfuse_tracer = None
     langfuse_generation = None
     trace_context = {}
+    # Langfuse 追踪:初始化 Langfuse 用于可观测性追踪
     langfuse_keys = TenantLangfuseService.filter_by_tenant(tenant_id=dialog.tenant_id)
     if langfuse_keys:
         langfuse = Langfuse(public_key=langfuse_keys.public_key, secret_key=langfuse_keys.secret_key, host=langfuse_keys.host)
@@ -608,6 +628,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     field_map = KnowledgebaseService.get_field_map(dialog.kb_ids)
     logging.debug(f"field_map retrieved: {field_map}")
     # try to use sql if field mapping is good to go
+    # SQL 检索尝试
+    # 1.尝试使用 SQL 进行结构化数据查询
+    # 2.成功则直接返回结果
     if field_map:
         logging.debug("Use SQL to retrieval:{}".format(questions[-1]))
         ans = await use_sql(questions[-1], field_map, dialog.tenant_id, chat_mdl, prompt_config.get("quote", True), dialog.kb_ids)
@@ -641,11 +664,14 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         if p["key"] not in kwargs:
             prompt_config["system"] = prompt_config["system"].replace("{%s}" % p["key"], " ")
 
+    # 查询增强
+    # 多轮对话精炼
     if len(questions) > 1 and prompt_config.get("refine_multiturn"):
         questions = [await full_question(dialog.tenant_id, dialog.llm_id, messages)]
     else:
         questions = questions[-1:]
 
+    # 跨语言
     if prompt_config.get("cross_languages"):
         questions = [await cross_languages(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config["cross_languages"])]
 
@@ -660,6 +686,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids),
         )
 
+    # 关键词提取
     if prompt_config.get("keyword", False):
         questions[-1] = questions[-1] + "," + await keyword_extraction(chat_mdl, questions[-1])
     refine_question_ts = timer()
@@ -668,11 +695,13 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     kbinfos = {"total": 0, "chunks": [], "doc_aggs": []}
     knowledges = []
 
+    # 知识检索
     if "knowledge" in param_keys:
         logging.debug("Proceeding with retrieval")
         tenant_ids = list(set([kb.tenant_id for kb in kbs]))
         knowledges = []
         if prompt_config.get("reasoning", False) or kwargs.get("reasoning"):
+            # 深度研究模式
             reasoner = DeepResearcher(
                 chat_mdl,
                 prompt_config,
@@ -711,6 +740,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
         else:
             if embd_mdl:
+                # 标准检索
                 kbinfos = await retriever.retrieval(
                     " ".join(questions),
                     embd_mdl,
@@ -726,6 +756,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     rerank_mdl=rerank_mdl,
                     rank_feature=label_question(" ".join(questions), kbs),
                 )
+                # 目录增强
                 if prompt_config.get("toc_enhance"):
                     cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
                     if cks:
@@ -736,6 +767,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                 tav_res = tav.retrieve_chunks(" ".join(questions))
                 kbinfos["chunks"].extend(tav_res["chunks"])
                 kbinfos["doc_aggs"].extend(tav_res["doc_aggs"])
+            # 知识图谱
             if prompt_config.get("use_kg"):
                 default_chat_model = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
                 ck = await settings.kg_retriever.retrieval(" ".join(questions), tenant_ids, dialog.kb_ids, embd_mdl, LLMBundle(dialog.tenant_id, default_chat_model, trace_context=trace_context, langfuse_session_id=session_id))
@@ -750,6 +782,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         )
         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
 
+    # 知识整合
+    # 1.将检索到的知识块转换为提示词格式
+    # 2.限制 Token 数量
     knowledges = kb_prompt(kbinfos, max_tokens)
     logging.debug("{}->{}".format(" ".join(questions), "\n->".join(knowledges)))
 
@@ -759,6 +794,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         yield {"answer": empty_res, "reference": kbinfos, "prompt": "\n\n### Query:\n%s" % " ".join(questions), "audio_binary": tts(tts_mdl, empty_res), "final": True}
         return
 
+    # 构建提示词
+    # 1.将知识注入系统提示词
+    # 2.适配上下文长度
     kwargs["knowledge"] = "\n------\n" + "\n\n------\n\n".join(knowledges)
     gen_conf = dialog.llm_setting
 
@@ -786,6 +824,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             think = ans[0] + "</think>"
             answer = ans[1]
 
+        # 引用标注 ： 在回答中插入引用标记 [ID:xxx]
         if knowledges and (prompt_config.get("quote", True) and kwargs.get("quote", True)):
             idx = set([])
             normalized_answer = normalize_arabic_digits(answer) or ""
@@ -882,6 +921,8 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             langfuse_tracer = None
             langfuse_generation = None
 
+    # LLM 生成
+    # 流式生成
     if stream:
         if llm_model_config["model_type"] == "chat":
             stream_iter = chat_mdl.async_chat_streamly_delta(prompt + prompt4citation, msg[1:], gen_conf)
@@ -901,6 +942,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             final["final"] = True
             final["audio_binary"] = None
             yield final
+    # 非流式生成
     else:
         if llm_model_config["model_type"] == "chat":
             answer = await chat_mdl.async_chat(prompt + prompt4citation, msg[1:], gen_conf)
@@ -1719,27 +1761,46 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
 
 
 async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
+    """
+    从知识库中检索与问题相关的内容，通过 LLM 提取关键概念，生成结构化的思维导图数据。
+    """
     meta_data_filter = search_config.get("meta_data_filter", {})
     doc_ids = search_config.get("doc_ids", [])
     rerank_id = search_config.get("rerank_id", "")
     rerank_mdl = None
+
+    # 获取知识库信息
     kbs = KnowledgebaseService.get_by_ids(kb_ids)
+    # 验证知识库是否存在
     if not kbs:
         return {"error": "No KB selected"}
+    # 收集所有租户 ID
     tenant_ids = list(set([kb.tenant_id for kb in kbs]))
+
+    # 初始化 Embedding 模型
+    # 使用第一个知识库的租户 ID
     embd_owner_tenant_id = kbs[0].tenant_id
     embd_model_config = get_model_config_from_provider_instance(embd_owner_tenant_id, LLMType.EMBEDDING, kbs[0].embd_id)
+    # 获取 Embedding 模型配置
     embd_mdl = LLMBundle(embd_owner_tenant_id, embd_model_config)
+
+    # 初始化 Chat 模型
+    # 1.优先使用搜索配置中的 Chat 模型
+    # 2.否则使用租户默认模型
     chat_id = search_config.get("chat_id", "")
     if chat_id:
         chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.CHAT, chat_id)
     else:
         chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
     chat_mdl = LLMBundle(tenant_id, chat_model_config)
+    # 初始化 Rerank 模型 : 如果配置了重排序模型，初始化
     if rerank_id:
         rerank_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.RERANK, rerank_id)
         rerank_mdl = LLMBundle(tenant_id, rerank_model_config)
 
+    # 应用元数据过滤
+    # 1.如果配置了元数据过滤，应用过滤条件
+    # 2.限制检索的文档范围
     if meta_data_filter:
         doc_ids = await apply_meta_data_filter(
             meta_data_filter,
@@ -1751,6 +1812,9 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
         )
 
+    # 执行检索
+    # 1.执行混合检索
+    # 2.返回 12 个最相关的文档片段
     ranks = await settings.retriever.retrieval(
         question=question,
         embd_mdl=embd_mdl,
@@ -1766,6 +1830,10 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
         rerank_mdl=rerank_mdl,
         rank_feature=label_question(question, kbs),
     )
+    # 提取思维导图
+    # 1.创建 MindMapExtractor 实例
+    # 2.传入检索到的内容
+    # 3.返回生成的思维导图
     mindmap = MindMapExtractor(chat_mdl)
     mind_map = await mindmap([c["content_with_weight"] for c in ranks["chunks"]])
     return mind_map.output

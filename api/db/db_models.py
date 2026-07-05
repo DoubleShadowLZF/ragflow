@@ -773,12 +773,21 @@ class Tenant(DataBaseModel):
 
 
 class UserTenant(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    user_id = CharField(max_length=32, null=False, index=True)
-    tenant_id = CharField(max_length=32, null=False, index=True)
-    role = CharField(max_length=32, null=False, help_text="UserTenantRole", index=True)
-    invited_by = CharField(max_length=32, null=False, index=True)
-    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
+    """
+    建立用户和租户之间的关联关系，实现用户对多个租户的访问权限管理。
+    """
+    # 标识字段
+    id = CharField(max_length=32, primary_key=True) # 主键，关联记录的唯一标识符
+    # 关联字段
+    user_id = CharField(max_length=32, null=False, index=True) # 用户 ID，关联的用户标识
+    tenant_id = CharField(max_length=32, null=False, index=True) # 租户 ID，关联的租户标识
+
+    # 权限字段
+    role = CharField(max_length=32, null=False, help_text="UserTenantRole", index=True) # 角色，用户在租户中的权限级别
+    invited_by = CharField(max_length=32, null=False, index=True) # 邀请人 ID，记录用户被谁邀请
+
+    # 状态字段
+    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True) # 状态：0（已废弃）/ 1（有效）
 
     class Meta:
         db_table = "user_tenant"
@@ -992,48 +1001,101 @@ class Task(DataBaseModel):
 
 
 class Dialog(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    tenant_id = CharField(max_length=32, null=False, index=True)
-    name = CharField(max_length=255, null=True, help_text="dialog application name", index=True)
-    description = TextField(null=True, help_text="Dialog description")
-    icon = TextField(null=True, help_text="icon base64 string")
-    language = CharField(max_length=32, null=True, default="Chinese" if "zh_CN" in os.getenv("LANG", "") else "English", help_text="English|Chinese", index=True)
-    llm_id = CharField(max_length=128, null=False, help_text="default llm ID")
-    tenant_llm_id = IntegerField(null=True, help_text="id in tenant_llm", index=True)
+    """
+    存储对话应用的所有配置，包括知识库选择、模型设置、检索参数、提示词配置等。
+    数据存储示例
+    {
+        "id": "chat_abc123",
+        "tenant_id": "tenant_001",
+        "name": "技术文档助手",
+        "description": "基于技术文档的问答助手",
+        "icon": "data:image/png;base64,...",
+        "language": "Chinese",
+        "llm_id": "gpt-4",
+        "tenant_llm_id": 101,
+        "llm_setting": {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.3,
+            "max_tokens": 2048
+        },
+        "prompt_type": "advanced",
+        "prompt_config": {
+            "system": "你是一个技术文档助手，基于提供的文档回答问题。",                        # 系统提示词
+            "prologue": "你好！我是技术文档助手，有什么可以帮助你的？",                       # 开场白
+            "parameters": [                                                             # 参数列表
+                {"name": "category", "type": "string", "description": "文档分类"}
+            ],
+            "empty_response": "抱歉，在知识库中没有找到相关内容。"                           # 空结果响应
+        },
+        "meta_data_filter": {
+            "method": "auto",
+            "conditions": [
+                {"key": "status", "op": "==", "value": "published"}
+            ]
+        },
+        "similarity_threshold": 0.2,
+        "vector_similarity_weight": 0.3,
+        "top_k": 1024,
+        "top_n": 6,
+        "rerank_id": "rerank_model_001",
+        "tenant_rerank_id": 102,
+        "kb_ids": ["kb_001", "kb_002"],
+        "do_refer": "1",
+        "status": "1"
+    }
+    """
+    # 基本标识字段
+    id = CharField(max_length=32, primary_key=True) # 主键，对话的唯一标识符
+    tenant_id = CharField(max_length=32, null=False, index=True) # 租户 ID，实现多租户隔离
+    name = CharField(max_length=255, null=True, help_text="dialog application name", index=True) # 对话名称，租户内唯一
+    description = TextField(null=True, help_text="Dialog description") # 描述，对话的详细说明
+    icon = TextField(null=True, help_text="icon base64 string") # 图标，Base64 编码的图片
+    language = CharField(max_length=32, null=True, default="Chinese" if "zh_CN" in os.getenv("LANG", "") else "English", help_text="English|Chinese", index=True) # 语言，根据系统环境自动设置
 
-    llm_setting = JSONField(null=False, default={"temperature": 0.1, "top_p": 0.3, "frequency_penalty": 0.7, "presence_penalty": 0.4, "max_tokens": 512})
-    prompt_type = CharField(max_length=16, null=False, default="simple", help_text="simple|advanced", index=True)
+    # 模型配置字段
+    llm_id = CharField(max_length=128, null=False, help_text="default llm ID") # LLM 模型 ID，用于生成回答
+    tenant_llm_id = IntegerField(null=True, help_text="id in tenant_llm", index=True) # 租户 LLM ID，在 tenant_llm 表中的 ID
+    llm_setting = JSONField(null=False, default={"temperature": 0.1, "top_p": 0.3, "frequency_penalty": 0.7, "presence_penalty": 0.4, "max_tokens": 512}) # LLM 参数：temperature、top_p 等
+    rerank_id = CharField(max_length=128, null=False, help_text="default rerank model ID") # 重排序模型 ID
+    tenant_rerank_id = IntegerField(null=True, help_text="id in tenant_llm", index=True) # 租户重排序 ID
+
+    # 检索参数字段
+    top_k = IntegerField(default=1024) # 最大召回数量
+    top_n = IntegerField(default=6) # 返回给 LLM 的片段数量
+    similarity_threshold = FloatField(default=0.2) # 相似度阈值
+    vector_similarity_weight = FloatField(default=0.3) # 向量权重（混合检索）
+
+    # 知识库字段
+    kb_ids = JSONField(null=False, default=[]) # 知识库 ID 列表
+    meta_data_filter = JSONField(null=True, default={}) # 元数据过滤条件
+
+    # 提示词配置字段
+    prompt_type = CharField(max_length=16, null=False, default="simple", help_text="simple|advanced", index=True) # 提示词类型：simple / advanced
     prompt_config = JSONField(
         null=False,
         default={"system": "", "prologue": "Hi! I'm your assistant. What can I do for you?", "parameters": [], "empty_response": "Sorry! No relevant content was found in the knowledge base!"},
-    )
-    meta_data_filter = JSONField(null=True, default={})
+    ) # 提示词配置
+    do_refer = CharField(max_length=1, null=False, default="1", help_text="it needs to insert reference index into answer or not") # 是否插入引用索引
 
-    similarity_threshold = FloatField(default=0.2)
-    vector_similarity_weight = FloatField(default=0.3)
-
-    top_n = IntegerField(default=6)
-
-    top_k = IntegerField(default=1024)
-
-    do_refer = CharField(max_length=1, null=False, default="1", help_text="it needs to insert reference index into answer or not")
-
-    rerank_id = CharField(max_length=128, null=False, help_text="default rerank model ID")
-    tenant_rerank_id = IntegerField(null=True, help_text="id in tenant_llm", index=True)
-    kb_ids = JSONField(null=False, default=[])
-    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
+    # 状态字段
+    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True) # 状态：0（已废弃）/ 1（有效）
 
     class Meta:
         db_table = "dialog"
 
 
 class Conversation(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    dialog_id = CharField(max_length=32, null=False, index=True)
-    name = CharField(max_length=255, null=True, help_text="conversation name", index=True)
-    message = JSONField(null=True)
-    reference = JSONField(null=True, default=[])
-    user_id = CharField(max_length=255, null=True, help_text="user_id", index=True)
+    """
+    存储单个会话的完整信息，包括消息历史、引用来源和会话元数据。
+    """
+    id = CharField(max_length=32, primary_key=True)                                          # 主键，会话的唯一标识符
+    dialog_id = CharField(max_length=32, null=False, index=True)                             # 对话 ID，关联 Dialog 模型
+    name = CharField(max_length=255, null=True, help_text="conversation name", index=True)   # 会话名称，用户自定义
+    message = JSONField(null=True)                                                           # 消息历史，对话的完整消息记录
+    reference = JSONField(null=True, default=[])                                             # 引用来源，回答中引用的文档列表
+    user_id = CharField(max_length=255, null=True, help_text="user_id", index=True)          # 用户 ID，会话的所有者
 
     class Meta:
         db_table = "conversation"
@@ -1481,9 +1543,12 @@ class SystemSettings(DataBaseModel):
         db_table = "system_settings"
 
 class TenantModelProvider(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    provider_name = CharField(max_length=128, null=False, index=False, help_text="LLM provider name")
-    tenant_id = CharField(max_length=32, null=False, index=True)
+    """
+    建立租户与 LLM 提供商之间的关联，支持每个租户配置不同的 LLM 提供商。
+    """
+    id = CharField(max_length=32, primary_key=True) # 主键，记录的唯一标识符
+    provider_name = CharField(max_length=128, null=False, index=False, help_text="LLM provider name") # 提供商名称，如 OpenAI、Azure、SiliconFlow 等
+    tenant_id = CharField(max_length=32, null=False, index=True) # 租户 ID，关联的租户标识
 
     class Meta:
         db_table = "tenant_model_provider"
@@ -1492,25 +1557,91 @@ class TenantModelProvider(DataBaseModel):
         )
 
 class TenantModelInstance(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    instance_name = CharField(max_length=128, null=False, index=False, help_text="Model instance name")
-    provider_id = CharField(max_length=32, null=False, index=False)
-    api_key = CharField(max_length=512, null=False, index=False, help_text="API key")
-    status = CharField(max_length=32, default="active", index=False)
-    extra = CharField(max_length=512, default="{}", index=False)
+    """
+    存储 LLM 模型实例的连接配置，包括 API 密钥、实例名称等。
+
+    数据存储示例
+    [
+        {
+            "id": "tmi_001",
+            "instance_name": "gpt-4-production",
+            "provider_id": "tmp_001",
+            "api_key": "sk-proj-abc123...",
+            "status": "active",
+            "extra": "{\"base_url\": \"https://api.openai.com/v1\", \"region\": \"us-east\"}"
+        },
+        {
+            "id": "tmi_002",
+            "instance_name": "azure-eastus",
+            "provider_id": "tmp_002",
+            "api_key": "azure-api-key...",
+            "status": "active",
+            "extra": "{\"base_url\": \"https://eastus.api.cognitive.microsoft.com\", \"deployment_name\": \"gpt-4\"}"
+        },
+        {
+            "id": "tmi_003",
+            "instance_name": "siliconflow-prod",
+            "provider_id": "tmp_003",
+            "api_key": "sf-api-key...",
+            "status": "inactive",
+            "extra": "{\"base_url\": \"https://api.siliconflow.cn\", \"region\": \"intl\"}"
+        }
+    ]
+    """
+    # 字段详细解释
+    id = CharField(max_length=32, primary_key=True)                                                     # 主键，实例的唯一标识符
+    instance_name = CharField(max_length=128, null=False, index=False, help_text="Model instance name") # 实例名称，如 gpt-4-instance、azure-eastus
+    provider_id = CharField(max_length=32, null=False, index=False)                                     # 提供商 ID，关联 TenantModelProvider
+    api_key = CharField(max_length=512, null=False, index=False, help_text="API key")                   # API 密钥，用于认证
+    status = CharField(max_length=32, default="active", index=False)                                    # 状态：active / inactive / error
+    extra = CharField(max_length=512, default="{}", index=False)                                        # 额外配置，JSON 格式存储
 
     class Meta:
         db_table = "tenant_model_instance"
 
 
 class TenantModel(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    model_name = CharField(max_length=128, null=True, index=False, help_text="Model name")
-    provider_id = CharField(max_length=32, null=False, index=False)
-    instance_id = CharField(max_length=32, null=False, index=True)
-    model_type = CharField(max_length=32, null=False, index=False, help_text="Model type")
-    status = CharField(max_length=32, default="active", index=False)
-    extra = CharField(max_length=1024, default="{}", index=False)
+    """
+    存储租户下具体的模型配置，包括模型名称、类型和额外参数。
+
+    数据存储示例
+    [
+        {
+            "id": "tm_001",
+            "model_name": "gpt-4",
+            "provider_id": "tmp_001",
+            "instance_id": "tmi_001",
+            "model_type": "chat",
+            "status": "active",
+            "extra": "{\"max_tokens\": 8192, \"is_tools\": true}"
+        },
+        {
+            "id": "tm_002",
+            "model_name": "text-embedding-3-small",
+            "provider_id": "tmp_001",
+            "instance_id": "tmi_001",
+            "model_type": "embedding",
+            "status": "active",
+            "extra": "{\"dimensions\": 1536}"
+        },
+        {
+            "id": "tm_003",
+            "model_name": "rerank-v2",
+            "provider_id": "tmp_001",
+            "instance_id": "tmi_001",
+            "model_type": "rerank",
+            "status": "active",
+            "extra": "{\"top_n\": 10}"
+        }
+    ]
+    """
+    id = CharField(max_length=32, primary_key=True)                                                     # 主键，模型配置的唯一标识符
+    model_name = CharField(max_length=128, null=True, index=False, help_text="Model name")              # 模型名称，如 gpt-4、qwen-7b
+    provider_id = CharField(max_length=32, null=False, index=False)                                     # 提供商 ID，关联 TenantModelProvider
+    instance_id = CharField(max_length=32, null=False, index=True)                                      # 实例 ID，关联 TenantModelInstance
+    model_type = CharField(max_length=32, null=False, index=False, help_text="Model type")              # 模型类型：chat / embedding / rerank / image2text
+    status = CharField(max_length=32, default="active", index=False)                                    # 状态：active / inactive
+    extra = CharField(max_length=1024, default="{}", index=False)                                       # 额外配置，JSON 格式
 
     class Meta:
         db_table = "tenant_model"
