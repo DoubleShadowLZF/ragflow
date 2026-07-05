@@ -446,31 +446,58 @@ class UpdateDocumentReq(Base):
 
     This model validates the request parameters for updating a document,
     including name, chunk method, enabled status, and other metadata.
+
+    验证文档更新请求中的字段，确保数据类型正确、值在有效范围内，并提供清晰的错误信息。
     """
 
+    # 基础配置
+    # extra="ignore"：忽略请求中未定义的额外字段
+    # 防止意外字段污染数据
     model_config = ConfigDict(extra="ignore")
-    name: Annotated[str | None, Field(default=None, max_length=65535)]
-    chunk_method: Annotated[str | None, Field(default=None, max_length=65535)]
-    pipeline_id: Annotated[str | None, Field(default=None, max_length=65535)]
-    enabled: Annotated[int | None, Field(default=None, ge=0, le=1)]
-    chunk_count: Annotated[int | None, Field(default=None, ge=0)]
-    token_count: Annotated[int | None, Field(default=None, ge=0)]
-    progress: Annotated[float | None, Field(default=None, ge=0.0, le=1.0)]
-    parser_config: Annotated[ParserConfig | None, Field(default=None)]
+    name: Annotated[str | None, Field(default=None, max_length=65535)]          # 文档名称
+    chunk_method: Annotated[str | None, Field(default=None, max_length=65535)]  # 分块方法
+    pipeline_id: Annotated[str | None, Field(default=None, max_length=65535)]   # 管道 ID
+    enabled: Annotated[int | None, Field(default=None, ge=0, le=1)]             # 是否启用（0/1）
+    chunk_count: Annotated[int | None, Field(default=None, ge=0)]               # 分块数量
+    token_count: Annotated[int | None, Field(default=None, ge=0)]               # Token 数量
+    progress: Annotated[float | None, Field(default=None, ge=0.0, le=1.0)]      # 处理进度（0-1）
+    parser_config: Annotated[ParserConfig | None, Field(default=None)]          # 解析器配置
     meta_fields: Annotated[dict | None, Field(default={})]
 
+    # 验证器：分块方法
+    # 1.只验证传入的值
+    # 2.空值跳过验证
+    # 3.支持 13 种分块方法
     @field_validator("chunk_method", mode="after")
     @classmethod
     def validate_document_chunk_method(cls, chunk_method: str | None):
         """Validate an optional document parser method."""
         if chunk_method:
             # Validate chunk method if present
+            # 支持的分块方法
+            # 方法	            说明	        适用场景
+            # naive	            基础分块	    通用文档
+            # manual	        手动分块	    用户自定义
+            # qa	            问答分块	    问答对
+            # table	            表格分块	    表格文档
+            # paper	            论文分块	    学术论文
+            # book	            书籍分块	    长文档
+            # laws	            法律分块	    法律文档
+            # presentation	    演示分块	    PPT
+            # picture	        图片分块	    图片文档
+            # one	            单块	        小文档
+            # knowledge_graph	知识图谱分块	知识库
+            # email	            邮件分块      邮件
+            # tag	            标签分块      标签文档
             valid_chunk_method = {"naive", "manual", "qa", "table", "paper", "book", "laws", "presentation", "picture", "one", "knowledge_graph", "email", "tag"}
             if chunk_method not in valid_chunk_method:
                 raise PydanticCustomError("format_invalid", "`chunk_method` {chunk_method} doesn't exist", {"chunk_method": chunk_method})
 
         return chunk_method
 
+    # 验证器：启用状态
+    # 1.值必须为 0 或 1
+    # 2.自动转换为整数
     @field_validator("enabled", mode="after")
     @classmethod
     def validate_document_enabled(cls, enabled: str | None):
@@ -482,6 +509,10 @@ class UpdateDocumentReq(Base):
 
         return enabled
 
+    # 验证器：元数据字段
+    # 1.必须是字典类型
+    # 2.值支持的类型：str、int、float、list[str/int/float]
+    # 3.递归验证列表中的元素类型
     @field_validator("meta_fields", mode="after")
     @classmethod
     def validate_document_meta_fields(cls, meta_fields: dict | None):

@@ -198,15 +198,30 @@ class DocMetadataService:
 
         Returns:
             Search results from ES/Infinity, or empty list if index doesn't exist
+
+        从向量数据库的元数据索引中分页查询文档元数据，支持 ES 和 Infinity 两种存储引擎。
+
+        使用场景
+        场景	        用途
+        元数据导出	批量导出文档元数据
+        元数据过滤	按条件过滤文档
+        数据迁移	    迁移元数据到新系统
+        调试分析	    检查元数据完整性
         """
+        # 验证知识库是否存在
         kb = Knowledgebase.get_by_id(kb_id)
         if not kb:
             return []
 
+        # 根据租户 ID 生成元数据索引名称
         tenant_id = kb.tenant_id
         index_name = cls._get_doc_meta_index_name(tenant_id)
 
         # Check if metadata index exists, create if it doesn't
+        # 索引自动创建
+        # 1.检查索引是否存在
+        # 2.不存在则自动创建
+        # 3.创建失败时返回空结果
         if not settings.docStoreConn.index_exist(index_name, ""):
             logging.debug(f"Metadata index {index_name} does not exist, creating it")
             result = settings.docStoreConn.create_doc_meta_idx(index_name)
@@ -215,14 +230,19 @@ class DocMetadataService:
                 return []
             logging.debug(f"Successfully created metadata index {index_name}")
 
+        # 构建查询条件
+        # 默认按 kb_id 过滤
         if condition is None:
             condition = {"kb_id": kb_id}
 
         # Add sort by id for ES to enable search_after on large data
+        # ES 需要按 id 排序以支持 search_after（深度分页）
+        # Infinity 不需要排序
         order_by = OrderByExpr()
         if not settings.DOC_ENGINE_INFINITY:
             order_by.asc("id")
 
+        # 分页循环检索
         page_size = 1000
         all_results = []
         page = 0
@@ -249,6 +269,10 @@ class DocMetadataService:
             total_count = None  # Used for Infinity to determine if more results exist
 
             # Check for Infinity format first (DataFrame, total) tuple
+            # 处理不同数据源的结果格式
+            # Infinity 格式
+            # 1.Infinity 返回 (DataFrame, total) 元组
+            # 2.使用 to_dict('records') 转换为字典列表
             if isinstance(results, tuple) and len(results) == 2:
                 df, total_count = results
                 if hasattr(df, 'iterrows'):
@@ -257,6 +281,10 @@ class DocMetadataService:
                 else:
                     page_docs = list(df) if df else []
             # Check for ES format (dict with 'hits' key)
+            # Elasticsearch 格式
+            # 1.ES 返回 {"hits": {"hits": [...]}} 格式
+            # 2.从 _source 提取文档数据
+            # 3.从 _id 提取文档 ID
             elif hasattr(results, 'get') and 'hits' in results:
                 hits_obj = results.get('hits', {})
                 hits = hits_obj.get('hits', [])
@@ -277,6 +305,7 @@ class DocMetadataService:
             else:
                 page_docs = []
 
+            # 分页终止条件
             if not page_docs:
                 break
 
@@ -285,11 +314,14 @@ class DocMetadataService:
 
             # Determine if there are more results to fetch
             # For Infinity: use total_count if available
+            # Infinity：使用 total_count 判断是否完成
             if total_count is not None:
                 if len(all_results) >= total_count:
                     break
             else:
                 # For ES or other: check if we got fewer than page_size
+                # ES：如果返回数量少于 page_size，说明已是最后一页
+                # 返回结果
                 if len(page_docs) < page_size:
                     break
 
@@ -1128,16 +1160,57 @@ class DocMetadataService:
                     "values": [("value1", count1), ("value2", count2), ...]  # sorted by count desc
                 }
             }
+
+        扫描知识库中所有文档的元数据，生成每个字段的统计摘要，包括数据类型和值分布。
+        使用场景
+        场景	        说明
+        元数据探索	用户查看知识库有哪些元数据字段
+        过滤建议	    根据值分布推荐过滤选项
+        数据类型推断	前端根据类型选择合适的输入控件
+        数据质量分析	检查元数据的一致性和完整性
+
+        输入文档元数据
+        doc_meta_1 = {"author": "张三", "year": 2024, "tags": ["AI", "ML"], "created_at": "2024-01-15T10:00:00"}
+        doc_meta_2 = {"author": "李四", "year": 2023, "tags": ["NLP"], "created_at": "2024-01-16T11:00:00"}
+        doc_meta_3 = {"author": "张三", "year": 2024, "tags": ["AI", "CV"], "created_at": "2024-01-17T12:00:00"}
+
+        输出结果
+        {
+            "author": {
+                "type": "string",
+                "values": [["张三", 2], ["李四", 1]]
+            },
+            "year": {
+                "type": "number",
+                "values": [["2024", 2], ["2023", 1]]
+            },
+            "tags": {
+                "type": "list",
+                "values": [["AI", 2], ["ML", 1], ["NLP", 1], ["CV", 1]]
+            },
+            "created_at": {
+                "type": "time",
+                "values": [
+                    ["2024-01-15T10:00:00", 1],
+                    ["2024-01-16T11:00:00", 1],
+                    ["2024-01-17T12:00:00", 1]
+                ]
+            }
+        }
         """
 
         def _is_time_string(value: str) -> bool:
-            """Check if a string value is an ISO 8601 datetime (e.g., '2026-02-03T00:00:00')."""
+            """Check if a string value is an ISO 8601 datetime (e.g., '2026-02-03T00:00:00').
+            时间字符串检测
+            """
             if not isinstance(value, str):
                 return False
             return bool(re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$', value))
 
         def _meta_value_type(value):
-            """Determine the type of a metadata value."""
+            """Determine the type of a metadata value.
+            值类型推断
+            """
             if value is None:
                 return None
             if isinstance(value, list):
@@ -1151,6 +1224,9 @@ class DocMetadataService:
             return "string"
 
         try:
+            # 查询元数据
+            # 1.按知识库 ID 查询所有文档元数据
+            # 2.可选按文档 ID 过滤
             condition = {"kb_id": kb_id}
             if doc_ids:
                 condition["id"] = doc_ids
@@ -1159,8 +1235,9 @@ class DocMetadataService:
                 return {}
 
             # Aggregate metadata
-            summary = {}
-            type_counter = {}
+            # 聚合统计
+            summary = {}            # {字段名: {值: 计数}}
+            type_counter = {}       # {字段名: {类型: 计数}}
 
             logging.debug(f"[METADATA SUMMARY] KB: {kb_id}, doc_ids: {doc_ids}")
 
@@ -1171,6 +1248,7 @@ class DocMetadataService:
 
                 for k, v in doc_meta.items():
                     # Track type counts for this field
+                    # # 统计类型
                     value_type = _meta_value_type(v)
                     if value_type:
                         if k not in type_counter:
@@ -1178,6 +1256,7 @@ class DocMetadataService:
                         type_counter[k][value_type] = type_counter[k].get(value_type, 0) + 1
 
                     # Aggregate value counts
+                    # 统计值分布
                     values = v if isinstance(v, list) else [v]
                     for vv in values:
                         if vv is None:
@@ -1188,6 +1267,9 @@ class DocMetadataService:
                         summary[k][sv] = summary[k].get(sv, 0) + 1
 
             # Build result with type information and sorted values
+            # 构建结果
+            # 1.按出现次数降序排列值
+            # 2.选择出现最多的类型作为字段类型
             result = {}
             for k, v in summary.items():
                 values = sorted([(val, cnt) for val, cnt in v.items()], key=lambda x: x[1], reverse=True)

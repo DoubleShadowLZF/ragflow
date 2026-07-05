@@ -170,6 +170,8 @@ async def update_document(tenant_id, dataset_id, document_id):
         description: Document updated successfully.
         schema:
           type: object
+
+    更新指定知识库中指定文档的配置信息，包括元数据、解析器配置、分块方法等。
     """
     req = await get_request_json()
 
@@ -186,7 +188,9 @@ async def update_document(tenant_id, dataset_id, document_id):
         return get_error_data_result(message="The dataset doesn't own the document.")
 
     # Validate document update request parameters
+    # 请求数据验证
     try:
+        # 使用 UpdateDocumentReq 验证请求数据
         update_doc_req = UpdateDocumentReq(**req)
     except ValidationError as e:
         return get_error_data_result(message=format_validation_error_message(e), code=RetCode.DATA_ERROR)
@@ -194,6 +198,7 @@ async def update_document(tenant_id, dataset_id, document_id):
     doc = docs[0]
 
     # further check with inner status (from DB)
+    # 用 validate_document_update_fields 进行业务逻辑验证
     error_msg, error_code = validate_document_update_fields(update_doc_req, doc, req)
     if error_msg:
         return get_error_data_result(message=error_msg, code=error_code)
@@ -201,39 +206,53 @@ async def update_document(tenant_id, dataset_id, document_id):
     # All validations passed, now perform all updates
     # meta_fields provided, then update it
     if "meta_fields" in req:
+        #  更新元数据
         if not DocMetadataService.update_document_metadata(document_id, update_doc_req.meta_fields):
             return get_error_data_result(message="Failed to update metadata")
     # doc name provided from request and diff with existing value, update
+    # 更新文档名称
     if "name" in req and req["name"] != doc.name:
         if error := update_document_name_only(document_id, req["name"]):
             return error
 
     # "parser_id" provided but does not match with existing doc's file type
+    # 解析器类型校验
+    # 1.图片文档只能使用 picture 解析器
+    # 2.PPT/Pages 文档只能使用 presentation 解析器
     if "parser_id" in req and ((doc.type == FileType.VISUAL and req["parser_id"] != "picture")
             or (re.search(r"\.(ppt|pptx|pages)$", doc.name) and req["parser_id"] != "presentation")):
         return get_data_error_result(message="Not supported yet!")
 
     # parser config provided (already validated in UpdateDocumentReq), update it
+    # 更新解析器配置
+    # 1.合并 ext 字段到 parser_config
+    # 2.更新数据库中的解析器配置
     if update_doc_req.parser_config:
         req["parser_config"].update(update_doc_req.parser_config.ext)
         DocumentService.update_parser_config(doc.id, req["parser_config"])
 
     # pipeline_id provided - reset document for reparse
+    # 更新管道或分块方法
+    # 如果提供了 pipeline_id：重置文档，使用新管道重新解析
     if update_doc_req.pipeline_id:
         if error := reset_document_for_reparse(doc, tenant_id, pipeline_id=update_doc_req.pipeline_id):
             return error
     # chunk method provided - the update method will check if it's different with existing one
+    # 如果提供了 chunk_method：更新分块方法
     elif update_doc_req.chunk_method:
         if error := update_chunk_method(req, doc, tenant_id):
             return error
 
+    # 更新启用状态:更新文档的启用/禁用状态
     if "enabled" in req: # already checked in UpdateDocumentReq - it's int if present
         # "enabled" flag provided, the update method will check if it's changed and then update if so
         if error := update_document_status_only(int(req["enabled"]), doc, kb):
             return error
 
+    # 返回更新后的文档
     try:
         original_doc_id = doc.id
+        # 重新获取文档信息
         ok, doc = DocumentService.get_by_id(doc.id)
         if not ok:
             return get_error_data_result(message=f"Can not get document by id:{original_doc_id}")
