@@ -210,15 +210,59 @@ class Base(ABC):
         return gen_conf
 
     async def _async_chat_streamly(self, history, gen_conf, **kwargs):
+        """
+        与 LLM API 进行流式对话，处理响应数据，提取内容并计算 Token 使用量。
+
+        输入
+        history = [{"role": "user", "content": "Python是什么？"}]
+        gen_conf = {"temperature": 0.7}
+
+        LLM 流式响应
+        # Chunk 1: {"choices": [{"delta": {"content": "Python"}}]}
+        # Chunk 2: {"choices": [{"delta": {"content": "是一种"}}]}
+        # Chunk 3: {"choices": [{"delta": {"content": "编程语言"}}]}
+
+        输出
+        # 输出 1: ("Python", 1)
+        # 输出 2: ("是一种", 2)
+        # 输出 3: ("编程语言", 3)
+
+        思考内容处理
+        # LLM 返回 reasoning_content
+        # Chunk: {"choices": [{"delta": {"reasoning_content": "让我思考一下"}}]}
+
+        # 输出: ("<think>让我思考一下</think>", token_count)
+
+        --------------
+        支持的模型
+        模型类型	        思考内容字段	        示例
+        DeepSeek R1	    reasoning_content	DeepSeek-R1, DeepSeek-R1-Distill
+        OpenAI	        无	                GPT-4, GPT-3.5
+        Anthropic	    无	                Claude 系列
+        Gemini	        无	                Gemini Pro
+
+        """
         logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
+        # 标记思考内容的开始,用于包装 <think> 标签
         reasoning_start = False
 
+        # 构建请求参数
+        # 1.,设置模型名称、消息列表、流式模式
+        # 2.合并生成配置
+        # 3.支持停止词（stop）
         request_kwargs = {"model": self.model_name, "messages": history, "stream": True, **gen_conf}
         stop = kwargs.get("stop")
         if stop:
             request_kwargs["stop"] = stop
 
+        # 发送请求
+        # 1.使用异步客户端发送请求
+        # 2.支持 OpenAI 兼容 API
         response = await self.async_client.chat.completions.create(**request_kwargs)
+        # 理流式响应
+        # 1.遍历响应流的每个 chunk
+        # 2.检查是否有思考内容（reasoning_content）
+        # 3.用 <think> 标签包装思考内容
         async for resp in response:
             if not resp.choices:
                 continue
@@ -234,26 +278,49 @@ class Base(ABC):
             else:
                 reasoning_start = False
                 ans = resp.choices[0].delta.content
+            # Token 计数
             tol = total_token_count_from_response(resp)
+            # 优先使用 API 返回的 Token 计数,如果没有，手动估算
             if not tol:
                 tol = num_tokens_from_string(resp.choices[0].delta.content)
 
+            # 处理长度截断
+            # 1.如果响应因长度限制被截断
+            # 2.添加提示信息（中文或英文）
             finish_reason = resp.choices[0].finish_reason if hasattr(resp.choices[0], "finish_reason") else ""
             if finish_reason == "length":
                 if is_chinese(ans):
                     ans += LENGTH_NOTIFICATION_CN
                 else:
                     ans += LENGTH_NOTIFICATION_EN
-            yield ans, tol
+            yield ans, tol # 返回文本内容和 Token 计数
 
     async def async_chat_streamly(self, system, history, gen_conf: dict | None = None, **kwargs):
+        """
+        以流式方式调用 LLM，逐块返回响应内容，支持自动重试机制。
+
+        输入
+        system = "你是一个翻译助手"
+        history = [{"role": "user", "content": "Hello"}]
+        gen_conf = {"temperature": 0.7}
+
+        流式输出
+        # 输出序列
+        "你" -> "好" -> "！" -> "你" -> "想" -> "翻" -> "译" -> "什" -> "么" -> "？"
+        """
         gen_conf = dict(gen_conf or {})
+        # 确保系统提示词在历史消息的第一位
         if system and history and history[0].get("role") != "system":
             history.insert(0, {"role": "system", "content": system})
-        gen_conf = self._clean_conf(gen_conf)
-        ans = ""
-        total_tokens = 0
+        gen_conf = self._clean_conf(gen_conf) # 清洗配置参数（移除不支持的参数）
+        ans = "" # 累积的回答内容（用于重试时记录）
+        total_tokens = 0 # 累计使用的 Token 数量
 
+        # 重试循环
+        # 1.最多重试 max_retries + 1 次
+        # 2.每次迭代调用底层流式方法 _async_chat_streamly
+        # 3.成功时返回累积的 Token 计数
+        # 4.失败时调用 _exceptions_async 处理异常
         for attempt in range(self.max_retries + 1):
             try:
                 async for delta_ans, tol in self._async_chat_streamly(history, gen_conf, **kwargs):
@@ -471,24 +538,37 @@ class Base(ABC):
         assert False, "Shouldn't be here."
 
     async def async_chat_streamly_with_tools(self, system: str, history: list, gen_conf: dict | None = None):
+        """
+        以流式方式执行 LLM 对话，支持工具调用（Function Calling），自动处理多轮工具调用循环。
+        """
         gen_conf = dict(gen_conf or {})
-        gen_conf = self._clean_conf(gen_conf)
-        tools = self.tools
-        if system and history and history[0].get("role") != "system":
+        gen_conf = self._clean_conf(gen_conf) # 清洗生成配置
+        tools = self.tools # 获取绑定的工具列表
+        if system and history and history[0].get("role") != "system": # 确保系统提示词在最前面
             history.insert(0, {"role": "system", "content": system})
 
         total_tokens = 0
-        hist = deepcopy(history)
+        hist = deepcopy(history) # 深拷贝历史消息（用于重试）
 
+        # 重试循环
+        # 1.支持自动重试（max_retries）
+        # 2.每次重试使用原始历史消息
         for attempt in range(self.max_retries + 1):
             history = deepcopy(hist)
             try:
+                # 工具调用循环
+                # 1.支持多轮工具调用（max_rounds）
+                # 2.每轮发送当前历史消息
                 for _round in range(self.max_rounds + 1):
                     reasoning_start = False
                     logging.info(f"[ToolLoop] round={_round} model={self.model_name} tools={[t['function']['name'] for t in tools]}")
 
                     response = await self.async_client.chat.completions.create(model=self.model_name, messages=history, stream=True, tools=tools, tool_choice="auto", **gen_conf)
 
+                    # 处理流式响应
+                    # 1.支持流式工具调用参数累积
+                    # 2.支持 reasoning_content（思考过程）
+                    # 3.实时输出内容
                     final_tool_calls = {}
                     answer = ""
 
@@ -498,6 +578,7 @@ class Base(ABC):
 
                         delta = resp.choices[0].delta
 
+                        # 处理工具调用
                         if hasattr(delta, "tool_calls") and delta.tool_calls:
                             for tool_call in delta.tool_calls:
                                 index = tool_call.index
@@ -512,6 +593,7 @@ class Base(ABC):
                         if not hasattr(delta, "content") or delta.content is None:
                             delta.content = ""
 
+                        # 处理内容
                         _reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                         if _reasoning:
                             ans = ""
@@ -519,9 +601,11 @@ class Base(ABC):
                                 reasoning_start = True
                                 ans = "<think>"
                             ans += _reasoning + "</think>"
+                            # 思考内容
                             yield ans
                         else:
                             reasoning_start = False
+                            # 正常内容
                             answer += delta.content
                             yield delta.content
 
@@ -535,14 +619,23 @@ class Base(ABC):
                         if finish_reason == "length":
                             yield self._length_stop("")
 
+                    # 执行工具调用
                     if answer and not final_tool_calls:
                         logging.info(f"[ToolLoop] round={_round} completed with text response, exiting")
+                        # 没有工具调用，返回最终答案
                         yield total_tokens
                         return
 
                     async def _exec_tool(tc):
+                        """
+                        工具执行函数
+                        1.解析工具参数
+                        2.支持异步和同步工具调用
+                        3.返回工具执行结果
+                        """
                         name = tc.function.name
                         try:
+                            # 使用 json_repair 容错解析,防止 LLM 输出不规范的 JSON
                             args = json_repair.loads(tc.function.arguments)
                             if not isinstance(args, dict):
                                 raise TypeError(
@@ -565,11 +658,16 @@ class Base(ABC):
                         except Exception:
                             args = {}
                         yield self._verbose_tool_use(tc.function.name, args, "Begin to call...")
+                    # 执行所有工具调用
                     results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
+                    # 将工具结果追加到历史消息
                     history = self._append_history_batch(history, results)
                     for tc, name, args, result, err in results:
                         yield self._verbose_tool_use(name, args, err if err else result)
 
+                # 处理超轮次
+                # 1.如果超过最大轮次，通知 LLM 超限
+                # 2.获取最终响应
                 logging.warning(f"Exceed max rounds: {self.max_rounds}")
                 history.append({"role": "user", "content": f"Exceed max rounds: {self.max_rounds}"})
 
@@ -581,7 +679,9 @@ class Base(ABC):
                     delta = resp.choices[0].delta
                     if not hasattr(delta, "content") or delta.content is None:
                         continue
+                    # Token 计数
                     tol = total_token_count_from_response(resp)
+                    # 优先使用 API 返回的 Token 计数，否则手动估算
                     if not tol:
                         total_tokens += num_tokens_from_string(delta.content)
                     else:

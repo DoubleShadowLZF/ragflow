@@ -404,6 +404,13 @@ class LLMBundle(LLM4Tenant):
         return queue
 
     async def async_chat(self, system: str, history: list, gen_conf: dict = {}, **kwargs):
+        """
+        以非流式方式调用 LLM，返回完整的响应内容，支持工具调用和 Langfuse 追踪。
+        """
+        # 选择底层调用方法
+        # 优先级 1：如果启用工具调用且模型支持 async_chat_with_tools，使用该方法
+        # 优先级 2：使用标准 async_chat 方法
+        # 失败：抛出运行时错误
         if self.is_tools and getattr(self.mdl, "is_tools", False) and hasattr(self.mdl, "async_chat_with_tools"):
             base_fn = self.mdl.async_chat_with_tools
         elif hasattr(self.mdl, "async_chat"):
@@ -411,13 +418,20 @@ class LLMBundle(LLM4Tenant):
         else:
             raise RuntimeError(f"Model {self.mdl} does not implement async_chat or async_chat_with_tools")
 
+        # 启动 Langfuse 追踪
+        # 如果启用了 Langfuse，创建可观测性追踪
+        # 记录输入参数
         generation = None
         if self.langfuse:
             generation = self._start_langfuse_observation(trace_context=self.trace_context, as_type="generation", name="chat", model=self.model_config["llm_name"], input={"system": system, "history": history})
 
-        chat_partial = partial(base_fn, system, history, gen_conf)
-        use_kwargs = self._clean_param(chat_partial, **kwargs)
+        chat_partial = partial(base_fn, system, history, gen_conf) # 使用 partial 预填充系统提示词、历史消息和生成配置
+        use_kwargs = self._clean_param(chat_partial, **kwargs) # 使用 _clean_param 过滤不支持的参数
 
+        # 执行 LLM 调用
+        # 1.执行 LLM 调用
+        # 2.返回响应内容和 Token 使用量
+        # 3.异常时记录错误到 Langfuse
         try:
             txt, used_tokens = await chat_partial(**use_kwargs)
         except Exception as e:
@@ -426,13 +440,18 @@ class LLMBundle(LLM4Tenant):
                 generation.end()
             raise
 
+        # 后处理
+        # 1.移除思考内容（_remove_reasoning_content）
+        # 2.如果不想显示工具调用，移除 <tool_call> 标签
         txt = self._remove_reasoning_content(txt)
         if not self.verbose_tool_use:
             txt = re.sub(r"<tool_call>.*?</tool_call>", "", txt, flags=re.DOTALL)
 
+        # 日志记录,记录 Token 使用量
         if used_tokens:
             logging.info("LLMBundle.async_chat used_tokens: {}, llm_name: {}".format(used_tokens, self.model_config["llm_name"]))
 
+        # 更新 Langfuse 追踪
         if generation:
             generation.update(output={"output": txt}, usage_details={"total_tokens": used_tokens})
             generation.end()
@@ -486,8 +505,15 @@ class LLMBundle(LLM4Tenant):
             return
 
     async def async_chat_streamly_delta(self, system: str, history: list, gen_conf: dict = {}, **kwargs):
-        total_tokens = 0
-        ans = ""
+        """
+         LLM 流式对话的核心实现。它负责以流式方式调用 LLM，逐 token 返回响应内容，并支持工具调用、Langfuse 追踪等功能。
+        """
+        total_tokens = 0 # 累计使用的 Token 数量
+        ans = "" # 累积的完整回答内容
+        # 选择底层流式方法
+        # 优先级 1：如果启用工具调用且模型支持 async_chat_streamly_with_tools，使用该方法
+        # 优先级 2：使用标准 async_chat_streamly 方法
+        # 失败：抛出运行时错误
         if self.is_tools and getattr(self.mdl, "is_tools", False) and hasattr(self.mdl, "async_chat_streamly_with_tools"):
             stream_fn = getattr(self.mdl, "async_chat_streamly_with_tools", None)
         elif hasattr(self.mdl, "async_chat_streamly"):
@@ -496,21 +522,29 @@ class LLMBundle(LLM4Tenant):
             raise RuntimeError(f"Model {self.mdl} does not implement async_chat or async_chat_with_tools")
 
         generation = None
+        # 启动 Langfuse 追踪,创建可观测性追踪,记录输入参数
         if self.langfuse:
             generation = self._start_langfuse_observation(trace_context=self.trace_context, as_type="generation", name="chat_streamly", model=self.model_config["llm_name"], input={"system": system, "history": history})
 
+        # 执行流式调用
+        # 1.使用 partial 预填充参数
+        # 2.使用 _clean_param 过滤不支持的参数
+        # 3.遍历流式输出的每个文本块
         if stream_fn:
             chat_partial = partial(stream_fn, system, history, gen_conf)
             use_kwargs = self._clean_param(chat_partial, **kwargs)
             try:
                 async for txt in chat_partial(**use_kwargs):
+                    # 处理 Token 计数
                     if isinstance(txt, int):
                         total_tokens = txt
                         break
 
+                    # 处理思考标记
                     if txt.endswith("</think>") and ans.endswith("</think>"):
                         ans = ans[: -len("</think>")]
 
+                    # 隐藏工具调用
                     if not self.verbose_tool_use:
                         txt = re.sub(r"<tool_call>.*?</tool_call>", "", txt, flags=re.DOTALL)
 
@@ -521,6 +555,7 @@ class LLMBundle(LLM4Tenant):
                     generation.update(output={"error": str(e)})
                     generation.end()
                 raise
+            # 后处理与追踪结束
             if total_tokens:
                 logging.info("LLMBundle.async_chat_streamly_delta used_tokens: {}, llm_name: {}".format(total_tokens, self.model_config["llm_name"]))
             if generation:

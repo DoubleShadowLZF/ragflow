@@ -610,6 +610,9 @@ class FileService(CommonService):
 
     @staticmethod
     def get_blob(user_id, location):
+        """
+        根据用户 ID 和文件位置标识，从存储系统中获取文件的二进制数据。
+        """
         bname = f"{user_id}-downloads"
         return settings.STORAGE_IMPL.get(bname, location)
 
@@ -811,11 +814,24 @@ class FileService(CommonService):
 
     @staticmethod
     def get_files(files: Union[None, list[dict]], raw: bool = False, layout_recognize: str = None) -> Union[list[str], tuple[list[str], list[dict]]]:
+        """
+        从文件列表中获取文件内容（文本）或原始文件对象，支持图片的 Base64 编码转换。
+        """
         if not files:
             return  []
         def image_to_base64(file):
+            """
+            图片转 Base64 内部函数
+            1.从存储中获取图片文件的二进制数据
+            2.编码为 Base64 字符串
+            3.构建 Data URI 格式：data:{mime_type};base64,{base64_data}
+            """
             return "data:{};base64,{}".format(file["mime_type"],
                                         base64.b64encode(FileService.get_blob(file["created_by"], file["id"])).decode("utf-8"))
+
+        # 并行处理
+        # 使用 ThreadPoolExecutor 并行处理（最多 5 个线程）
+        # 初始化任务列表 threads 和图片列表 imgs
         with ThreadPoolExecutor(max_workers=5) as exe:
             threads = []
             imgs = []

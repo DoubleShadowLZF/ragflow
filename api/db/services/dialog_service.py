@@ -287,7 +287,26 @@ class DialogService(CommonService):
 
 
 async def async_chat_solo(dialog, messages, stream=True, session_id=None):
+    """
+    处理不涉及知识库检索的纯对话请求，支持流式和非流式响应。
+
+    与 async_chat 的对比
+    特性	        async_chat_solo	    async_chat
+    知识库检索	❌ 无	            ✅ 有
+    SQL 检索	    ❌ 无	            ✅ 有
+    网络搜索	    ❌ 无	            ✅ 有
+    知识图谱	    ❌ 无	            ✅ 有
+    引用系统	    ❌ 无	            ✅ 有
+    TTS 支持	    ✅ 有	            ✅ 有
+    多模态支持	✅ 有             	✅ 有
+    流式响应	    ✅ 有             	✅ 有
+    """
+    # 模型类型检测:获取 LLM 模型类型（chat / image2text）
     llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+    # 附件处理
+    # 1.处理用户上传的文件
+    # 2.区分文本附件和图片附件
+    # 3.多模态模型支持图片输入
     attachments = ""
     image_attachments = []
     image_files = []
@@ -298,6 +317,7 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
             text_attachments, image_files = split_file_attachments(messages[-1]["files"], raw=True)
         attachments = "\n\n".join(text_attachments)
 
+    # 模型初始化:使用指定的 LLM 模型或租户默认模型
     if dialog.llm_id:
         model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
     else:
@@ -306,27 +326,42 @@ async def async_chat_solo(dialog, messages, stream=True, session_id=None):
     chat_mdl = LLMBundle(dialog.tenant_id, model_config, langfuse_session_id=session_id)
     factory = model_config.get("llm_factory", "") if model_config else ""
 
+    # TTS 模型初始化:如果启用了 TTS，初始化语音合成模型
     prompt_config = dialog.prompt_config
     tts_mdl = None
     if prompt_config.get("tts"):
         default_tts_model = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.TTS)
         tts_mdl = LLMBundle(dialog.tenant_id, default_tts_model, trace_context=chat_mdl.trace_context, langfuse_session_id=session_id)
+    # 构建消息
+    # 1.过滤系统消息
+    # 2.移除引用标记 ##数字$$
+    # 3.将附件内容追加到最后一条用户消息
     msg = [{"role": m["role"], "content": re.sub(r"##\d+\$\$", "", m["content"])} for m in messages if m["role"] != "system"]
     if attachments and msg:
         msg[-1]["content"] += attachments
+    # 多模态转换
+    # 1.将图片附件转换为多模态格式
+    # 2.适用于 GPT-4V 等模型
     if "chat" in llm_types and image_attachments:
+        # 将消息列表中最后一条用户消息中的图片，转换为特定模型厂商要求的格式
         convert_last_user_msg_to_multimodal(msg, image_attachments, factory)
+    # 流式响应
+    # 1.使用 _stream_with_think_delta 处理思考标记
+    # 2.kind == "marker" 处理 <think> 开始/结束标记
+    # 3.普通文本调用 TTS 生成音频
     if stream:
         if "chat" in llm_types:
             stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting)
         else:
             stream_iter = chat_mdl.async_chat_streamly_delta(prompt_config.get("system", ""), msg, dialog.llm_setting, images=image_files)
+        # 处理 LLM 流式输出中的 <think> 和 </think> 标记，将思考内容和正常回答分开
         async for kind, value, state in _stream_with_think_delta(stream_iter):
             if kind == "marker":
                 flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
                 yield {"answer": "", "reference": {}, "audio_binary": None, "prompt": "", "created_at": time.time(), "final": False, **flags}
                 continue
             yield {"answer": value, "reference": {}, "audio_binary": tts(tts_mdl, value), "prompt": "", "created_at": time.time(), "final": False}
+    # 非流式响应
     else:
         if "chat" in llm_types:
             answer = await chat_mdl.async_chat(prompt_config.get("system", ""), msg, dialog.llm_setting)
@@ -369,18 +404,31 @@ def get_models(dialog, trace_context=None, langfuse_session_id=None):
 
 
 def split_file_attachments(files: list[dict] | None, raw: bool = False) -> tuple[list[str], list[str] | list[dict]]:
+    """
+    将文件附件列表中的文本文件和图片文件分开，便于后续处理（如多模态输入）。
+    """
     if not files:
         return [], []
 
     text_attachments = []
+    # 原始模式（raw=True）
+    # 1.调用 FileService.get_files(files, raw=True) 获取文件内容和文件对象
+    # 2.所有文件内容都被视为文本附件
+    # 3.返回 (文本内容列表, 图片文件对象列表)
     if raw:
         file_contents, image_files = FileService.get_files(files, raw=True)
         for content in file_contents:
             if not isinstance(content, str):
                 content = str(content)
             text_attachments.append(content)
-        return text_attachments, image_files
+        return text_attachments, image_files # 返回 (文本内容列表, 图片文件对象列表)
 
+    #  内容模式（raw=False，默认）
+    # 1.调用 FileService.get_files(files, raw=False) 获取文件内容
+    # 2.判断内容是否以 data: 开头（Data URI 格式）
+    #   是 → 归类为图片附件
+    #   否 → 归类为文本附件
+    # 3.返回 (文本内容列表, 图片内容列表)
     image_attachments = []
     for content in FileService.get_files(files, raw=False):
         if not isinstance(content, str):
@@ -425,18 +473,35 @@ def _normalize_text_from_content(content) -> str:
 
 
 def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[str], factory: str) -> None:
+    """
+    核心功能
+    1.多模态转换：将用户消息中的图片转换为不同模型厂商要求的格式
+    2.引用标记识别：定义多种引用格式的正则表达式
+    """
+    # 如果没有消息或图片，直接返回
     if not msg or not image_data_uris:
         return
 
+    # 规范化厂商名称（小写）
     factory_norm = (factory or "").strip().lower()
 
+    # 查找最后一条用户消息
     for idx in range(len(msg) - 1, -1, -1):
+        # 从后向前遍历，找到最后一条用户消息
         if msg[idx].get("role") != "user":
             continue
 
         original_content = msg[idx].get("content", "")
+        # 提取文本内容
         text = _normalize_text_from_content(original_content)
 
+        # Google Gemini 格式
+        # {
+        #     "content": [
+        #         {"text": "描述这张图片"},
+        #         {"inline_data": {"mime_type": "image/png", "data": "base64..."}}
+        #     ]
+        # }
         if factory_norm == "gemini":
             parts = []
             if text:
@@ -447,6 +512,13 @@ def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[s
             msg[idx]["content"] = parts
             return
 
+        # Anthropic 格式
+        # {
+        #     "content": [
+        #         {"type": "text", "text": "描述这张图片"},
+        #         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "base64..."}}
+        #     ]
+        # }
         if factory_norm == "anthropic":
             blocks = []
             if text:
@@ -462,6 +534,13 @@ def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[s
             msg[idx]["content"] = blocks
             return
 
+        # OpenAI 格式（默认）
+        # {
+        #     "content": [
+        #         {"type": "text", "text": "描述这张图片"},
+        #         {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+        #     ]
+        # }
         multimodal_content = []
         if isinstance(original_content, list):
             multimodal_content = deepcopy(original_content)
@@ -1504,14 +1583,32 @@ def _extract_visible_answer(text: str) -> str:
 
 
 async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
+    """
+    处理 LLM 流式输出中的 <think> 和 </think> 标记，将思考内容和正常回答分开，并实现智能的文本缓冲策略。
+    """
+    # 状态管理
+    # 使用状态对象追踪：
+    # in_think: 当前是否在思考块内
+    # think_buffer: 思考内容缓冲区
+    # answer_buffer: 回答内容缓冲区
+    # full_text: 完整累积的文本
+    # close_pending: 是否有待关闭的 </think> 标记
     state = _ThinkStreamState()
 
     def _emit_text(section: str, text: str):
+        """
+        文本输出控制
+        1.思考内容直接返回（不缓冲）
+        2.回答内容缓冲到 min_tokens 数量后才输出
+        """
         if not text:
             return None
         if section == "think":
             return text
         state.answer_buffer += text
+        # 智能缓冲策略
+        # 1.回答内容累积到 min_tokens 后才输出
+        # 2.减少网络传输次数，提升效率
         if num_tokens_from_string(state.answer_buffer) >= min_tokens:
             out = state.answer_buffer
             state.answer_buffer = ""
@@ -1519,6 +1616,7 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
         return None
 
     def _flush_think_buffer():
+        """刷新思考缓冲区"""
         if not state.think_buffer:
             return None
         out = state.think_buffer
@@ -1526,15 +1624,18 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
         return out
 
     def _flush_answer_buffer():
+        """刷新思考缓冲区"""
         if not state.answer_buffer:
             return None
         out = state.answer_buffer
         state.answer_buffer = ""
         return out
 
+    # 流式处理循环
     async for chunk in stream_iter:
         if not chunk:
             continue
+        # 处理 chunk 合并
         if chunk.startswith(state.last_model_full):
             new_part = chunk[len(state.last_model_full) :]
             state.last_model_full = chunk
@@ -1546,6 +1647,7 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
         state.full_text += new_part
         pending = new_part
 
+        # 处理已关闭的思考块
         if state.close_pending and "</think>" not in pending:
             state.close_pending = False
             think_piece = _flush_think_buffer()
@@ -1553,6 +1655,7 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
                 yield ("text", think_piece, state)
             state.in_think = False
             yield ("marker", "</think>", state)
+            # 处理待输出的内容
             if state.pending_after_close:
                 answer_piece = state.pending_after_close
                 state.pending_after_close = ""
@@ -1566,6 +1669,7 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
                     yield ("text", out, state)
             continue
 
+        # 标记解析
         while pending:
             open_idx = pending.find("<think>")
             close_idx = pending.find("</think>")
@@ -1579,6 +1683,7 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
                         yield ("text", out, state)
                 break
 
+            # 处理 <think> 标记
             if open_idx != -1 and (close_idx == -1 or open_idx < close_idx):
                 before = pending[:open_idx]
                 if before:
@@ -1599,6 +1704,7 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
                     yield ("marker", "<think>", state)
                 continue
 
+            # 处理 </think> 标记
             before = pending[:close_idx]
             after = pending[close_idx + len("</think>") :]
             if before:
@@ -1613,6 +1719,8 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
                 if think_piece is not None:
                     yield ("text", think_piece, state)
                 state.in_think = False
+                # 输出标记前的文本
+                # 输出 </think> 标记
                 yield ("marker", "</think>", state)
                 pending = after_visible
                 continue
@@ -1622,6 +1730,7 @@ async def _stream_with_think_delta(stream_iter, min_tokens: int = 16):
             pending = ""
             break
 
+    # 刷新缓冲区
     if state.think_buffer:
         yield ("text", state.think_buffer, state)
         state.think_buffer = ""
