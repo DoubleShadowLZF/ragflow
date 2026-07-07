@@ -722,6 +722,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         "dialog.kb_ids has %d entries and use_sql returned chunks without kb_id.",
                         len(dialog.kb_ids),
                     )
+                # 为检索结果中的每个 chunk 补充文档级别的元数据
                 _enrich_chunks_with_document_metadata(ans["reference"]["chunks"], metadata_fields)
             yield ans
             return
@@ -755,6 +756,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         questions = [await cross_languages(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config["cross_languages"])]
 
     if dialog.meta_data_filter:
+        # 根据用户指定的模式（auto/semi_auto/manual），应用元数据过滤规则，返回过滤后的文档ID列表。
         attachments = await apply_meta_data_filter(
             dialog.meta_data_filter,
             None,
@@ -804,6 +806,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                 await queue.put(msg + "<br/>")
 
             await callback("<START_DEEP_RESEARCH>")
+            # 通过树状查询分解，递归检索信息，直到获得足够的信息来回答复杂问题。
             task = asyncio.create_task(reasoner.research(kbinfos, questions[-1], questions[-1], callback=callback))
             while True:
                 msg = await queue.get()
@@ -1055,10 +1058,22 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
         A dict with keys ``answer`` (formatted response string), ``reference``
         (dict of supporting document chunks and doc_aggs), and ``prompt``
         (the system prompt used), or ``None`` if SQL generation or execution fails.
+
+    将自然语言问题转换为 SQL 查询，执行检索，返回格式化的结果和引用来源。
+    结构化数据查询的核心引擎
+    1.多引擎支持：Infinity、OceanBase、Elasticsearch
+    2.自然语言转 SQL：LLM 生成 SQL
+    3.自动修复：SQL 错误时重试
+    4.引用追踪：自动添加引用来源
+    5.SQL 注入防护：UUID 验证
+    6.可观测性：详细的日志记录
     """
     logging.debug(f"use_sql: Question: {question}")
 
     # Determine which document engine we're using
+    # 检测文档引擎
+    # 支持三种引擎：Infinity、OceanBase、Elasticsearch
+    # 影响表名生成和 SQL 语法
     if settings.DOC_ENGINE_INFINITY:
         doc_engine = "infinity"
     elif settings.DOC_ENGINE_OCEANBASE:
@@ -1076,6 +1091,9 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
     # Construct the full table name
     # For Elasticsearch: ragflow_{tenant_id} (kb_id is in WHERE clause)
     # For Infinity: ragflow_{tenant_id}_{kb_id} (each KB has its own table)
+    # 构建表名
+    # Infinity：表名包含 kb_id（{tenant_id}_{kb_id}）
+    # 其他引擎：使用基础索引名
     base_table = index_name(tenant_id)
     if doc_engine == "infinity" and kb_ids and len(kb_ids) == 1:
         # Infinity: append kb_id to table name — validate before interpolating
@@ -1095,7 +1113,9 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
         return "doc_id" in normalized_names and bool({"docnm_kwd", "docnm"} & normalized_names)
 
     def is_aggregate_sql(sql_text):
-        """Return True if *sql_text* contains an aggregate function (COUNT, SUM, AVG, MAX, MIN, DISTINCT)."""
+        """Return True if *sql_text* contains an aggregate function (COUNT, SUM, AVG, MAX, MIN, DISTINCT).
+        聚合查询（COUNT、SUM 等）不需要 doc_id 列
+        """
         return bool(re.search(r"(count|sum|avg|max|min|distinct)\s*\(", (sql_text or "").lower()))
 
     def normalize_sql(sql):
@@ -1120,27 +1140,44 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
         Infinity encodes the knowledge-base scope in the table name, so this
         function is a no-op for that engine.  All kb_id values are validated as
         canonical UUIDs before interpolation to prevent SQL injection.
+
+        将 kb_id 过滤条件注入 SQL 查询，同时防止 SQL 注入攻击。
         """
         # Add kb_id filter for ES/OS only (Infinity already has it in table name)
+        # 检查是否需要添加过滤
+        # Infinity 引擎：kb_id 已经在表名中编码（{tenant}_{kb_id}），无需额外过滤
+        # 无 kb_ids：没有知识库限制，无需添加过滤
         if doc_engine == "infinity" or not kb_ids:
             return sql
 
         # Validate all kb_ids are UUIDs before interpolating into SQL
         for kid in kb_ids:
+            # kb_id 注入防护（SQL 注入防护）
+            # 1.验证每个 kb_id 是否为有效的 UUID 格式
+            # 2.防止恶意 SQL 注入
             _assert_valid_uuid(kid, "kb_id")
 
         # Build kb_filter: single KB or multiple KBs with OR
+        # 构建过滤条件
+        # 单知识库：kb_id = 'uuid'
         if len(kb_ids) == 1:
             kb_filter = f"kb_id = '{kb_ids[0]}'"
+        # 多知识库：(kb_id = 'uuid1' OR kb_id = 'uuid2' OR ...)
         else:
             kb_filter = "(" + " OR ".join([f"kb_id = '{kid}'" for kid in kb_ids]) + ")"
 
+        # 注入过滤条件
+        # 如果没有 WHERE，在 ORDER BY 前插入
+        # 如果没有 ORDER BY，追加到末尾
         if "where " not in sql.lower():
             o = sql.lower().split("order by")
             if len(o) > 1:
                 sql = o[0] + f" WHERE {kb_filter}  order by " + o[1]
             else:
                 sql += f" WHERE {kb_filter}"
+        # 已有 WHERE 子句
+        # 如果已有 WHERE 但没有 kb_id 条件，在 WHERE 后追加 {kb_filter} and
+        # 避免重复添加
         elif "kb_id =" not in sql.lower() and "kb_id=" not in sql.lower():
             sql = re.sub(r"\bwhere\b ", f"where {kb_filter} and ", sql, flags=re.IGNORECASE)
         return sql
@@ -1237,6 +1274,16 @@ Write SQL using exact field names above. Include doc_id, docnm_kwd for data quer
             sql = row_count_override
         else:
             prompt = custom_user_prompt if custom_user_prompt is not None else user_prompt
+            # SQL 生成与规范化
+            #
+            # normalize_sql：清理 LLM 输出
+            # 1.移除思考块（<think>）
+            # 2.移除 Markdown 代码块
+            # 3.移除尾部分号
+            #
+            # add_kb_filter：注入 kb_id 过滤
+            # 1.Infinity：在表名中已包含，无需额外过滤
+            # 2.其他引擎：在 WHERE 子句中添加 kb_id = '...'
             sql = await chat_mdl.async_chat(sys_prompt, [{"role": "user", "content": prompt}], {"temperature": 0.06})
         sql = normalize_sql(sql)
         sql = add_kb_filter(sql)
@@ -1244,6 +1291,9 @@ Write SQL using exact field names above. Include doc_id, docnm_kwd for data quer
         logging.debug(f"{question} get SQL(refined): {sql}")
         tried_times += 1
         logging.debug(f"use_sql: Executing SQL retrieval (attempt {tried_times})")
+        # 执行 SQL 查询
+        # 1.调用检索器的 sql_retrieval 方法
+        # 2.返回 JSON 格式结果（{"columns": [...], "rows": [...]}）
         tbl = settings.retriever.sql_retrieval(sql, format="json")
         if tbl is None:
             logging.debug("use_sql: SQL retrieval returned None")
@@ -1252,8 +1302,17 @@ Write SQL using exact field names above. Include doc_id, docnm_kwd for data quer
         return tbl, sql
 
     async def repair_table_for_missing_source_columns(previous_sql):
+        """
+        当 SQL 查询结果缺少 doc_id 和 docnm 列时，通过 LLM 重写 SQL，确保结果包含引用来源所需的信息。
+        """
         if doc_engine in ("infinity", "oceanbase"):
+            # 处理 JSON 列提取
             json_field_names = list(field_map.keys())
+            # Infinity / OceanBase 修复提示词
+            # 1.包含表名、可用 JSON 字段列表
+            # 2.包含原始问题和错误 SQL
+            # 3.明确要求添加 doc_id 和 docnm 列
+            # 4.指定 JSON 提取函数 json_extract_string
             repair_prompt = """Table name: {};
 JSON fields available in 'chunk_data' column (use exact names):
 {}
@@ -1267,6 +1326,9 @@ Rewrite SQL to keep the same query intent and include doc_id and {} in the SELEC
 For extracted JSON fields, use json_extract_string(chunk_data, '$.field_name').
 Return ONLY SQL.""".format(table_name, "\n".join([f"  - {field}" for field in json_field_names]), question, previous_sql, expected_doc_name_column)
         else:
+            # Elasticsearch 修复提示词
+            # 1.类似但使用直接字段名（而非 JSON 提取）
+            # 2.字段列表包含类型信息
             repair_prompt = """Table name: {}
 Available fields:
 {}
@@ -1278,6 +1340,9 @@ Previous SQL:
 The previous SQL result is missing required source columns for citations.
 Rewrite SQL to keep the same query intent and include doc_id and docnm_kwd in the SELECT list.
 Return ONLY SQL.""".format(table_name, "\n".join([f"  - {k} ({v})" for k, v in field_map.items()]), question, previous_sql)
+        # 执行修复
+        # 1.调用 get_table 并传入自定义提示词
+        # 2.返回修复后的 SQL 和结果
         return await get_table(custom_user_prompt=repair_prompt)
 
     try:
@@ -1322,6 +1387,7 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
         Please correct the error and write SQL again using the exact field names above, only SQL, without any other explanations or text.
         """.format(table_name, "\n".join([f"{k} ({v})" for k, v in field_map.items()]), question, e)
         try:
+            # 生成SQL
             tbl, sql = await get_table()
             logging.debug(f"use_sql: Retry SQL execution SUCCESS. SQL: {sql}")
             logging.debug(f"use_sql: Retrieved {len(tbl.get('rows', []))} rows on retry")
@@ -1333,9 +1399,13 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
         logging.warning(f"use_sql: No rows returned from SQL query, returning None. SQL: {sql}")
         return None
 
+    # 结果处理
+    # 检测是否为聚合查询，缺失引用列时重试
     if not is_aggregate_sql(sql) and not has_source_columns(tbl.get("columns", [])):
         logging.warning(f"use_sql: Non-aggregate SQL missing required source columns; retrying once. SQL: {sql}")
         try:
+            # 非聚合查询必须包含 doc_id 和 docnm
+            # 缺失时通过修复提示词重试
             repaired_tbl, repaired_sql = await repair_table_for_missing_source_columns(sql)
             if repaired_tbl and len(repaired_tbl.get("rows", [])) > 0 and has_source_columns(repaired_tbl.get("columns", [])):
                 tbl, sql = repaired_tbl, repaired_sql
@@ -1361,6 +1431,9 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
 
     # Helper function to map column names to display names
     def map_column_name(col_name):
+        """
+        将数据库字段名映射为用户友好的显示名称
+        """
         if col_name.lower() == "count(star)":
             return "COUNT(*)"
 
@@ -1405,6 +1478,7 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
         return result
 
     # compose Markdown table
+    # 构建 Markdown 表格
     columns = "|" + "|".join([map_column_name(tbl["columns"][i]["name"]) for i in column_idx]) + ("|Source|" if docid_idx and doc_name_idx else "|")
 
     line = "|" + "|".join(["------" for _ in range(len(column_idx))]) + ("|------|" if docid_idx and docid_idx else "")
@@ -1423,6 +1497,7 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
             row_values.append(remove_redundant_spaces(str(value)).replace("None", " "))
         # Add Source column with citation marker if Source column exists
         if docid_idx and doc_name_idx:
+            # 每行添加引用标记 ##idx$$
             row_values.append(f" ##{row_idx}$$")
         row_str = "|" + "|".join(row_values) + "|"
         if re.sub(r"[ |]+", "", row_str):
@@ -1499,6 +1574,7 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
             doc_aggs[r[docid_idx]] = {"doc_name": r[doc_name_idx], "count": 0}
         doc_aggs[r[docid_idx]]["count"] += 1
 
+    # 构建引用来源
     result = {
         "answer": "\n".join([columns, line, rows]),
         "reference": {
@@ -1518,7 +1594,7 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
                 }
                 for r in tbl["rows"]
             ],
-            "doc_aggs": [{"doc_id": did, "doc_name": d["doc_name"], "count": d["count"]} for did, d in doc_aggs.items()],
+            "doc_aggs": [{"doc_id": did, "doc_name": d["doc_name"], "count": d["count"]} for did, d in doc_aggs.items()], # 文档聚合统计
         },
         "prompt": sys_prompt,
     }

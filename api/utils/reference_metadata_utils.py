@@ -27,6 +27,14 @@ def resolve_reference_metadata_preferences(
     Resolve metadata include/fields from request and optional config.
     Request values take precedence over config values.
     Supports legacy request keys: include_metadata / metadata_fields.
+
+    核心职责是：从请求和配置两个来源，解析并合并“引用元数据”的偏好设置。
+    将来自 request_payload 和 config_payload 的元数据引用偏好（reference_metadata）合并，Request 优先级高于 Config，并兼容旧版 include_metadata 和 metadata_fields 字段。
+
+    设计意图：
+    支持新字段 reference_metadata.include/fields
+    同时兼容旧字段 include_metadata 和 metadata_fields
+    旧字段优先级最高（直接在 resolved 上覆盖）
     """
     request_payload = request_payload or {}
     config_payload = config_payload or {}
@@ -73,10 +81,17 @@ def enrich_chunks_with_document_metadata(
     """
     Mutates chunk payloads in-place by attaching `document_metadata`.
     Field names can be customized for different chunk schemas.
+
+    从 DocMetadataService 获取文档元数据，并将其附加到每个 chunk 的 document_metadata 字段中。
     """
+    # 如果 metadata_fields 是空集合，直接返回（无需获取元数据）
     if metadata_fields is not None and not metadata_fields:
         return
 
+    # 收集文档 ID
+    # 1.按知识库 ID 分组收集文档 ID
+    # 2.支持 kb_id 为字符串或列表
+    # 3.用于批量查询元数据
     doc_ids_by_kb: dict[str, set[str]] = {}
     for chunk in chunks:
         kb_ids = chunk.get(kb_field)
@@ -95,6 +110,9 @@ def enrich_chunks_with_document_metadata(
 
     # Resolve service lazily so callers/tests that swap service modules at runtime
     # (e.g. via monkeypatch) don't get stuck with a stale class reference.
+    # 获取元数据服务
+    # 懒加载 DocMetadataService
+    # 支持运行时替换（便于测试）
     from api.db.services.doc_metadata_service import DocMetadataService
     metadata_getter = getattr(DocMetadataService, "get_metadata_for_documents", None)
     if not callable(metadata_getter):
@@ -104,6 +122,9 @@ def enrich_chunks_with_document_metadata(
         )
         return
 
+    # 批量获取元数据
+    # 1.按知识库分组批量获取元数据
+    # 2.合并结果到 meta_by_doc
     meta_by_doc: dict[str, dict] = {}
     for kb_id, doc_ids in doc_ids_by_kb.items():
         meta_map = metadata_getter(list(doc_ids), kb_id)
@@ -111,6 +132,11 @@ def enrich_chunks_with_document_metadata(
             meta_by_doc.update(meta_map)
             logging.debug("Fetched metadata for %d docs in kb_id=%s", len(meta_map), kb_id)
 
+    # 注入元数据到 chunk
+    # 1.遍历所有 chunk
+    # 2.根据 doc_id 获取对应的元数据
+    # 3.按需过滤元数据字段
+    # 4.注入到 chunk 的 document_metadata 字段
     for chunk in chunks:
         doc_id = chunk.get(doc_field)
         if not doc_id:

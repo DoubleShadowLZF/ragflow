@@ -504,19 +504,28 @@ class TenantLLMService(CommonService):
 
 
 class LLM4Tenant:
+    """
+    封装租户的 LLM 模型实例，提供统一的接口和资源管理。
+    """
     def __init__(self, tenant_id: str, model_config: dict, lang="Chinese", **kwargs):
-        self.trace_context = kwargs.pop("trace_context", None) or {}
-        self.langfuse_session_id = kwargs.pop("langfuse_session_id", None)
-        self.tenant_id = tenant_id
+        self.trace_context = kwargs.pop("trace_context", None) or {}                        # 追踪上下文（用于 Langfuse）
+        self.langfuse_session_id = kwargs.pop("langfuse_session_id", None)                  # Langfuse 会话 ID
+        self.tenant_id = tenant_id                                                          # 租户 ID(租户隔离:每个租户拥有独立的 LLM 实例;配置和资源相互隔离)
         self.llm_name = model_config["llm_name"]
-        self.model_config = model_config
+        self.model_config = model_config                                                    # 模型配置（包含 llm_name、model_type、max_tokens 等）
+        # 模型实例创建
         self.mdl = TenantLLMService.model_instance(model_config, lang=lang, **kwargs)
         assert self.mdl, "Can't find model for {}/{}/{}".format(tenant_id, model_config["model_type"], model_config["llm_name"])
-        self.max_length = model_config.get("max_tokens", 8192)
+        self.max_length = model_config.get("max_tokens", 8192)                              # 设置最大 Token 长度
 
-        self.is_tools = model_config.get("is_tools", False)
+        # 工具调用配置                                                                        # 是否支持工具调用
+        self.is_tools = model_config.get("is_tools", False)                                 # 是否显示工具调用详情
         self.verbose_tool_use = kwargs.get("verbose_tool_use")
 
+        # Langfuse 可观测性初始化
+        # 1.获取租户的 Langfuse 配置
+        # 2.验证连接
+        # 3.创建追踪 ID
         langfuse_keys = TenantLangfuseService.filter_by_tenant(tenant_id=tenant_id)
         self.langfuse = None
         if langfuse_keys:
@@ -538,8 +547,14 @@ class LLM4Tenant:
         to properly release resources such as:
         - Langfuse tracing client (flush and shutdown)
         - Underlying model instance resources (HTTP sessions, etc.)
+
+        资源释放方法
         """
         # Flush and shutdown Langfuse client if it was initialized
+        # Langfuse 资源释放
+        # 1.刷新 Langfuse 缓冲区
+        # 2.调用 shutdown() 释放连接
+        # 3.忽略错误，避免影响主流程
         if self.langfuse:
             try:
                 self.langfuse.flush()
@@ -552,6 +567,9 @@ class LLM4Tenant:
                 self.langfuse = None
 
         # Release underlying model instance if it has a close method
+        # 底层模型资源释放
+        # 1.检查底层模型是否有 close 方法
+        # 2.调用释放资源（如 HTTP 会话）
         if self.mdl and hasattr(self.mdl, 'close') and callable(getattr(self.mdl, 'close')):
             try:
                 self.mdl.close()

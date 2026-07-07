@@ -102,13 +102,13 @@ _DEFAULT_PROMPT_CONFIG = {
     "refine_multiturn": True,
 }
 _DEFAULT_DIRECT_CHAT_PROMPT_CONFIG = {
-    "system": "",
-    "prologue": "",
-    "parameters": [],
-    "empty_response": "",
-    "quote": False,
-    "tts": False,
-    "refine_multiturn": True,
+    "system": "",                      # 系统提示词
+    "prologue": "",                    # 开场白
+    "parameters": [],                  # 参数列表
+    "empty_response": "",              # 空响应消息
+    "quote": False,                    # 引用开关
+    "tts": False,                      # 语音合成开关
+    "refine_multiturn": True,          # 多轮对话精炼
 }
 _DEFAULT_RERANK_MODELS = {"BAAI/bge-reranker-v2-m3", "maidalun1020/bce-reranker-base_v1"}
 _READONLY_FIELDS = {"id", "tenant_id", "created_by", "create_time", "create_date", "update_time", "update_date"}

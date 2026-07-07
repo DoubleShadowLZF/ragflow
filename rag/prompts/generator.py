@@ -228,7 +228,7 @@ CITATION_PLUS_TEMPLATE = load_prompt("citation_plus")
 CONTENT_TAGGING_PROMPT_TEMPLATE = load_prompt("content_tagging_prompt")
 CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE = load_prompt("cross_languages_sys_prompt")
 CROSS_LANGUAGES_USER_PROMPT_TEMPLATE = load_prompt("cross_languages_user_prompt")
-FULL_QUESTION_PROMPT_TEMPLATE = load_prompt("full_question_prompt")
+FULL_QUESTION_PROMPT_TEMPLATE = load_prompt("full_question_prompt") # 多轮对话精炼的提示词模板，用于指导 LLM 将对话中的最后一轮问题转化为一个完整的、自包含的问题。
 KEYWORD_PROMPT_TEMPLATE = load_prompt("keyword_prompt")
 QUESTION_PROMPT_TEMPLATE = load_prompt("question_prompt")
 VISION_LLM_DESCRIBE_PROMPT = load_prompt("vision_llm_describe_prompt")
@@ -261,6 +261,9 @@ def citation_plus(sources: str) -> str:
 
 
 async def keyword_extraction(chat_mdl, content, topn=3):
+    """
+    关键词提取函数，核心职责是：使用大语言模型从给定的文本内容中提取 Top-N 个关键词。
+    """
     template = PROMPT_JINJA_ENV.from_string(KEYWORD_PROMPT_TEMPLATE)
     rendered_prompt = template.render(content=content, topn=topn)
 
@@ -291,10 +294,14 @@ async def question_proposal(chat_mdl, content, topn=3):
 
 
 async def full_question(tenant_id=None, llm_id=None, messages=[], language=None, chat_mdl=None):
+    """
+    将多轮对话中的最后一轮问题，结合历史对话上下文，精炼为一个完整的、自包含的问题。
+    """
     from common.constants import LLMType
     from api.db.services.llm_service import LLMBundle
     from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance, get_model_type_by_name
 
+    # 模型初始化
     if not chat_mdl:
         model_types = get_model_type_by_name(tenant_id, llm_id)
         if "image2text" in model_types:
@@ -302,16 +309,25 @@ async def full_question(tenant_id=None, llm_id=None, messages=[], language=None,
         else:
             chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.CHAT, llm_id)
         chat_mdl = LLMBundle(tenant_id, chat_model_config)
+    # 构建对话历史
+    # 1.过滤非对话角色（如 system）
+    # 2.格式：USER: 内容 和 ASSISTANT: 内容
     conv = []
     for m in messages:
         if m["role"] not in ["user", "assistant"]:
             continue
         conv.append("{}: {}".format(m["role"].upper(), m["content"]))
     conversation = "\n".join(conv)
+    # 日期上下文
+    # 1.提供日期上下文
+    # 2.用于处理时间相关查询（如"昨天"、"明天"）
     today = datetime.date.today().isoformat()
     yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
     tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
 
+    # 渲染提示词
+    # 1.使用 Jinja2 模板渲染
+    # 2.注入对话历史、日期、语言
     template = PROMPT_JINJA_ENV.from_string(FULL_QUESTION_PROMPT_TEMPLATE)
     rendered_prompt = template.render(
         today=today,
@@ -321,16 +337,31 @@ async def full_question(tenant_id=None, llm_id=None, messages=[], language=None,
         language=language,
     )
 
+    # 调用 LLM 生成完整问题
+    # 1.使用系统提示词 + 用户提示词
+    # 2.返回精炼后的完整问题
     ans = await chat_mdl.async_chat(rendered_prompt, [{"role": "user", "content": "Output: "}])
+    # 后处理与回退
+    # 1.移除思考链内容（</think>）
+    # 2.如果 LLM 返回错误，回退到原始问题
     ans = re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
     return ans if ans.find("**ERROR**") < 0 else messages[-1]["content"]
 
 
 async def cross_languages(tenant_id, llm_id, query, languages=[]):
+    """
+    使用 LLM 将用户查询翻译成指定的多种语言，返回多语言版本的查询语句。
+    """
     from common.constants import LLMType
     from api.db.services.llm_service import LLMBundle
     from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance, get_tenant_default_model_by_type, get_model_type_by_name
 
+    # 模型选择与初始化
+    # 模型选择逻辑：
+    # 条件	                模型类型	                    说明
+    # llm_id 存在且包含      "image2text"	IMAGE2TEXT	    多模态模型（支持图文理解）
+    # llm_id 不存在	        CHAT（默认）	                使用租户默认聊天模型
+    # llm_id 存在但不含      "image2text"	CHAT	        使用指定的聊天模型
     if llm_id and "image2text" in get_model_type_by_name(tenant_id, llm_id) :
         chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.IMAGE2TEXT, llm_id)
     else:
@@ -339,15 +370,29 @@ async def cross_languages(tenant_id, llm_id, query, languages=[]):
         else:
             chat_model_config = get_model_config_from_provider_instance(tenant_id, LLMType.CHAT, llm_id)
     chat_mdl = LLMBundle(tenant_id, chat_model_config)
+    # 构建提示词
+    # 使用 Jinja2 模板引擎渲染：
+    # 系统提示词：定义 LLM 的角色和行为规则（翻译专家）
+    # 用户提示词：包含待翻译的查询和目标语言列表
     rendered_sys_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE).render()
     rendered_user_prompt = PROMPT_JINJA_ENV.from_string(CROSS_LANGUAGES_USER_PROMPT_TEMPLATE).render(query=query,
                                                                                                      languages=languages)
 
+    # 调用 LLM 执行翻译
+    # temperature: 0.2：较低的随机性，使翻译结果更确定和一致
     ans = await chat_mdl.async_chat(rendered_sys_prompt, [{"role": "user", "content": rendered_user_prompt}],
                                     {"temperature": 0.2})
+    # 错误检测与回退
+    # 如果 LLM 返回了错误标记（**ERROR**），直接返回原始查询，确保系统可用性。
     if ans.find("**ERROR**") >= 0:
         logging.info("[cross_languages] LLM returned error, falling back to original query")
         return query
+    # 结果解析与格式化
+    # 1.移除 **ERROR** 标记及其之前的所有内容
+    # 2.移除 Output: 前缀和多余的换行符
+    # 3.按 === 分隔符拆分各语言翻译
+    # 4.过滤空字符串
+    # 5.用换行符连接
     ans = re.sub(r"^.*\*\*ERROR\*\*", "", ans, flags=re.DOTALL)
     result = "\n".join([a for a in re.sub(r"(^Output:|\n+)", "", ans, flags=re.DOTALL).split("===") if a.strip()])
     return result
@@ -1088,13 +1133,16 @@ async def sufficiency_check(chat_mdl, question: str, ret_content: str):
 
 MULTI_QUERIES_GEN = load_prompt("multi_queries_gen")
 async def multi_queries_gen(chat_mdl, question: str, query:str, missing_infos:list[str], ret_content: str):
+    """
+    用于在深度研究过程中生成补充查询
+    """
     try:
         return await gen_json(
             PROMPT_JINJA_ENV.from_string(MULTI_QUERIES_GEN).render(
-                original_question=question,
-                original_query=query,
-                missing_info="\n - ".join(missing_infos),
-                retrieved_docs=ret_content
+                original_question=question,                     # 原始完整问题
+                original_query=query,                           # 原始查询词
+                missing_info="\n - ".join(missing_infos),       # 缺失信息列表（用 \n - 连接）
+                retrieved_docs=ret_content                      # 已检索到的内容
             ),
             "Output:\n",
             chat_mdl

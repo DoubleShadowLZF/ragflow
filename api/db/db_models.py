@@ -861,10 +861,10 @@ class TenantLLM(DataBaseModel):
 
 
 class TenantLangfuse(DataBaseModel):
-    tenant_id = CharField(max_length=32, null=False, primary_key=True)
-    secret_key = CharField(max_length=2048, null=False, help_text="SECRET KEY", index=True)
-    public_key = CharField(max_length=2048, null=False, help_text="PUBLIC KEY", index=True)
-    host = CharField(max_length=128, null=False, help_text="HOST", index=True)
+    tenant_id = CharField(max_length=32, null=False, primary_key=True)                                 # 主键，租户 ID
+    secret_key = CharField(max_length=2048, null=False, help_text="SECRET KEY", index=True)            # 密钥，Langfuse API Secret Key
+    public_key = CharField(max_length=2048, null=False, help_text="PUBLIC KEY", index=True)            # 公钥，Langfuse API Public Key
+    host = CharField(max_length=128, null=False, help_text="HOST", index=True)                         # 主机地址，Langfuse 服务地址
 
     def __str__(self):
         return "Langfuse host" + self.host
