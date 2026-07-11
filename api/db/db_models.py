@@ -705,24 +705,55 @@ def fill_db_model_object(model_object, human_model_dict):
 
 
 class User(DataBaseModel, AuthUser):
+    """
+     用户认证和用户信息的核心数据模型。该模型同时继承了 DataBaseModel 和 AuthUser，为系统提供完整的用户管理功能。
+
+     e.g:
+     {
+        "id": "user_abc123",
+        "access_token": "eyJhbGciOiJIUzI1NiIs...",
+        "nickname": "张三",
+        "password": "$2b$12$...",  // bcrypt 哈希
+        "email": "zhangsan@example.com",
+        "avatar": "data:image/png;base64,iVBORw0KGgo...",
+        "language": "Chinese",
+        "color_schema": "Bright",
+        "timezone": "UTC+8\tAsia/Shanghai",
+        "last_login_time": "2024-01-15T10:00:00Z",
+        "is_authenticated": "1",
+        "is_active": "1",
+        "is_anonymous": "0",
+        "is_superuser": false,
+        "login_channel": "email",
+        "status": "1"
+    }
+    """
+    # 敏感字段保护 : 在序列化时自动过滤，防止泄露
     SENSITIVE_FIELDS = {"password", "access_token", "email"}
 
-    id = CharField(max_length=32, primary_key=True)
-    access_token = CharField(max_length=255, null=True, index=True)
-    nickname = CharField(max_length=100, null=False, help_text="nicky name", index=True)
-    password = CharField(max_length=255, null=True, help_text="password", index=True)
-    email = CharField(max_length=255, null=False, help_text="email", unique=True)
-    avatar = TextField(null=True, help_text="avatar base64 string")
-    language = CharField(max_length=32, null=True, help_text="English|Chinese", default="Chinese" if "zh_CN" in os.getenv("LANG", "") else "English", index=True)
-    color_schema = CharField(max_length=32, null=True, help_text="Bright|Dark", default="Bright", index=True)
-    timezone = CharField(max_length=64, null=True, help_text="Timezone", default="UTC+8\tAsia/Shanghai", index=True)
-    last_login_time = DateTimeField(null=True, index=True)
-    is_authenticated = CharField(max_length=1, null=False, default="1", index=True)
-    is_active = CharField(max_length=1, null=False, default="1", index=True)
-    is_anonymous = CharField(max_length=1, null=False, default="0", index=True)
-    login_channel = CharField(null=True, help_text="from which user login", index=True)
-    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
-    is_superuser = BooleanField(null=True, help_text="is root", default=False, index=True)
+    # 认证与安全字段
+    id = CharField(max_length=32, primary_key=True)                                          # 主键，用户唯一标识符
+    access_token = CharField(max_length=255, null=True, index=True)                          # 访问令牌，用于 API 认证
+    password = CharField(max_length=255, null=True, help_text="password", index=True)        # 密码，存储哈希值（不应存储明文）
+    email = CharField(max_length=255, null=False, help_text="email", unique=True)            # 邮箱，唯一标识，用于登录
+
+    # 用户基本信息
+    nickname = CharField(max_length=100, null=False, help_text="nicky name", index=True)                                                                            # 昵称，用户的显示名称
+    avatar = TextField(null=True, help_text="avatar base64 string")                                                                                                 # 头像，Base64 编码的图片
+    language = CharField(max_length=32, null=True, help_text="English|Chinese", default="Chinese" if "zh_CN" in os.getenv("LANG", "") else "English", index=True)   # 语言：Chinese / English
+    color_schema = CharField(max_length=32, null=True, help_text="Bright|Dark", default="Bright", index=True)                                                       # 配色方案：Bright / Dark
+    timezone = CharField(max_length=64, null=True, help_text="Timezone", default="UTC+8\tAsia/Shanghai", index=True)                                                # 时区，默认 UTC+8 Asia/Shanghai
+
+    # 认证状态字段
+    is_authenticated = CharField(max_length=1, null=False, default="1", index=True)           # 是否已认证
+    is_active = CharField(max_length=1, null=False, default="1", index=True)                  # 是否激活
+    is_anonymous = CharField(max_length=1, null=False, default="0", index=True)               # 是否匿名
+    is_superuser = BooleanField(null=True, help_text="is root", default=False, index=True)    # 是否超级用户
+
+    # 审计与状态字段
+    login_channel = CharField(null=True, help_text="from which user login", index=True)                                            # 最后登录时间
+    last_login_time = DateTimeField(null=True, index=True)                                                                         # 登录渠道（如 email、oauth）
+    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)       # 状态：0（废弃）/ 1（有效）
 
     def __str__(self):
         return self.email
@@ -1513,23 +1544,48 @@ class EvaluationResult(DataBaseModel):
 
 
 class Memory(DataBaseModel):
-    id = CharField(max_length=32, primary_key=True)
-    name = CharField(max_length=128, null=False, index=False, help_text="Memory name")
-    avatar = TextField(null=True, help_text="avatar base64 string")
-    tenant_id = CharField(max_length=32, null=False, index=True)
-    memory_type = IntegerField(null=False, default=1, index=True, help_text="Bit flags (LSB->MSB): 1=raw, 2=semantic, 4=episodic, 8=procedural. E.g., 5 enables raw + episodic.")
-    storage_type = CharField(max_length=32, default='table', null=False, index=True, help_text="table|graph")
-    embd_id = CharField(max_length=128, null=False, index=False, help_text="embedding model ID")
-    tenant_embd_id = IntegerField(null=True, help_text="id in tenant_llm", index=True)
-    llm_id = CharField(max_length=128, null=False, index=False, help_text="chat model ID")
-    tenant_llm_id = IntegerField(null=True, help_text="id in tenant_llm", index=True)
-    permissions = CharField(max_length=16, null=False, index=True, help_text="me|team", default="me")
-    description = TextField(null=True, help_text="description")
-    memory_size = IntegerField(default=5242880, null=False, index=False)
-    forgetting_policy = CharField(max_length=32, null=False, default="FIFO", index=False, help_text="LRU|FIFO")
-    temperature = FloatField(default=0.5, index=False)
-    system_prompt = TextField(null=True, help_text="system prompt", index=False)
-    user_prompt = TextField(null=True, help_text="user prompt", index=False)
+    """
+    存储用户的记忆配置，包括记忆类型、存储方式、模型配置、遗忘策略等。
+
+    位标志组合
+    Bit 0 (1):  Raw Memory      - 原始对话记录
+    Bit 1 (2):  Semantic Memory  - 语义知识
+    Bit 2 (4):  Episodic Memory  - 情景记忆（事件）
+    Bit 3 (8):  Procedural Memory - 程序记忆（技能）
+
+    组合示例
+    值	二进制	启用的类型
+    1	0001	Raw
+    2	0010	Semantic
+    3	0011	Raw + Semantic
+    4	0100	Episodic
+    5	0101	Raw + Episodic
+    7	0111	Raw + Semantic + Episodic
+    8	1000	Procedural
+    15	1111	全部启用
+    """
+    # 基本标识字段
+    id = CharField(max_length=32, primary_key=True)                                            # 主键，记忆的唯一标识符
+    name = CharField(max_length=128, null=False, index=False, help_text="Memory name")         # 名称，记忆的显示名称
+    avatar = TextField(null=True, help_text="avatar base64 string")                            # 头像，Base64 编码的图片
+    tenant_id = CharField(max_length=32, null=False, index=True)                               # 租户 ID，实现多租户隔离
+    description = TextField(null=True, help_text="description")                                # 描述，记忆的详细说明
+    # 记忆类型字段（位标志）
+    memory_type = IntegerField(null=False, default=1, index=True, help_text="Bit flags (LSB->MSB): 1=raw, 2=semantic, 4=episodic, 8=procedural. E.g., 5 enables raw + episodic.") # 位标志设计：使用整数位标志组合多种记忆类型;类型值：1（bit 0）：原始记忆（Raw）;2（bit 1）：语义记忆（Semantic）;3 → 原始 + 语义（1 + 2）;4（bit 2）：情景记忆（Episodic）;5 → 原始 + 情景（1 + 4）;7 → 原始 + 语义 + 情景（1 + 2 + 4）;8（bit 3）：程序记忆（Procedural）;
+    storage_type = CharField(max_length=32, default='table', null=False, index=True, help_text="table|graph")   # 存储类型：table（表格）/ graph（图数据库）
+    memory_size = IntegerField(default=5242880, null=False, index=False)                                        # 记忆大小，默认 5MB
+    forgetting_policy = CharField(max_length=32, null=False, default="FIFO", index=False, help_text="LRU|FIFO") # 遗忘策略：FIFO（先进先出）/ LRU（最近最少使用）
+    # 模型配置字段
+    embd_id = CharField(max_length=128, null=False, index=False, help_text="embedding model ID")                # Embedding 模型 ID，用于向量化
+    tenant_embd_id = IntegerField(null=True, help_text="id in tenant_llm", index=True)                          # 租户 Embedding ID，在 tenant_llm 表中的 ID
+    llm_id = CharField(max_length=128, null=False, index=False, help_text="chat model ID")                      # 聊天模型 ID，用于生成回答
+    tenant_llm_id = IntegerField(null=True, help_text="id in tenant_llm", index=True)                           # 租户 LLM ID
+    # 提示词配置字段
+    system_prompt = TextField(null=True, help_text="system prompt", index=False)                                # 系统提示词，定义 AI 角色
+    user_prompt = TextField(null=True, help_text="user prompt", index=False)                                    # 用户提示词，引导用户输入
+    temperature = FloatField(default=0.5, index=False)                                                          # 温度参数，控制随机性
+    # 权限字段
+    permissions = CharField(max_length=16, null=False, index=True, help_text="me|team", default="me")           # 权限级别：me（私有）/ team（团队共享）
 
     class Meta:
         db_table = "memory"

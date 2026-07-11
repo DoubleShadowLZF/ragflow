@@ -171,16 +171,24 @@ async def extract_by_llm(tenant_id: str, tenant_llm_id: int, extract_conf: dict,
 
 
 async def embed_and_save(memory, message_list: list[dict], task_id: str=None):
+    """
+    将消息内容向量化（Embedding），保存到向量索引中，并管理 Memory 的存储空间。
+    """
+    # 获取租户的 Embedding 模型配置
     embd_model_config = get_model_config_from_provider_instance(memory.tenant_id, LLMType.EMBEDDING, memory.embd_id)
+    # 使用上下文管理器管理模型资源
     with LLMBundle(memory.tenant_id, embd_model_config) as embedding_model:
         if task_id:
             TaskService.update_progress(task_id, {"progress": 0.65, "progress_msg": timestamp_to_date(current_timestamp())+ " " + "Prepared embedding model."})
+        # 将所有消息内容批量向量化
         vector_list, _ = embedding_model.encode([msg["content"] for msg in message_list])
         for idx, msg in enumerate(message_list):
+            # 将向量添加到消息对象中
             msg["content_embed"] = vector_list[idx]
         if task_id:
             TaskService.update_progress(task_id, {"progress": 0.85, "progress_msg": timestamp_to_date(current_timestamp())+ " " + "Embedded extracted content."})
         vector_dimension = len(vector_list[0])
+        # 检查 Memory 是否有向量索引,如果没有，创建新索引
         if not MessageService.has_index(memory.tenant_id, memory.id):
             created = MessageService.create_index(memory.tenant_id, memory.id, vector_size=vector_dimension)
             if not created:
@@ -189,6 +197,11 @@ async def embed_and_save(memory, message_list: list[dict], task_id: str=None):
                     TaskService.update_progress(task_id, {"progress": -1, "progress_msg": timestamp_to_date(current_timestamp())+ " " + error_msg})
                 return False, error_msg
 
+        # 存储空间管理
+        # 1.计算新消息大小
+        # 2.检查是否超出 Memory 容量
+        # 3.FIFO 策略：删除最早的消息
+        # 4.其他策略：返回错误
         new_msg_size = sum([MessageService.calculate_message_size(m) for m in message_list])
         current_memory_size = get_memory_size_cache(memory.tenant_id, memory.id)
         if new_msg_size + current_memory_size > memory.memory_size:
@@ -203,10 +216,12 @@ async def embed_and_save(memory, message_list: list[dict], task_id: str=None):
                 if task_id:
                     TaskService.update_progress(task_id, {"progress": -1, "progress_msg": timestamp_to_date(current_timestamp())+ " " + error_msg})
                 return False, error_msg
+        # 保存消息
         fail_cases = MessageService.insert_message(message_list, memory.tenant_id, memory.id)
         if fail_cases:
             error_msg = "Failed to insert message into memory. Details: " + "; ".join(fail_cases)
             if task_id:
+                # 更新缓存
                 TaskService.update_progress(task_id, {"progress": -1, "progress_msg": timestamp_to_date(current_timestamp())+ " " + error_msg})
             return False, error_msg
 
