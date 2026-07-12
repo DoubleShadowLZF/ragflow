@@ -13,6 +13,22 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+用户认证与租户管理 RESTful API 端点。
+
+本模块提供用户注册、登录/登出、OAuth 第三方登录、个人信息管理、
+租户模型配置、以及忘记密码（图形验证码 + 邮箱 OTP）等流程的 HTTP 端点。
+
+路由前缀: ``/api/v1``（由 ``api/apps/restful_apis/__init__.py`` 注册）。
+
+主要端点分组:
+
+- **认证** — ``/auth/login``、``/auth/logout``、``/auth/login/channels``、``/auth/login/<channel>``
+- **OAuth 回调** — ``/auth/oauth/<channel>/callback``
+- **用户管理** — ``/users``（注册）、``/users/me``（查询/修改个人信息）
+- **租户配置** — ``/users/me/models``（查询/更新租户模型设置）
+- **密码重置** — ``/auth/password/forgot/captcha`` → ``/otp`` → ``/otp/verify`` → ``/auth/password/reset``
+"""
 import logging
 import string
 import os
@@ -61,33 +77,10 @@ from common import settings
 @manager.route("/auth/login", methods=["POST"])  # noqa: F821
 async def login():
     """
-    User login endpoint.
-    ---
-    tags:
-      - User
-    parameters:
-      - in: body
-        name: body
-        description: Login credentials.
-        required: true
-        schema:
-          type: object
-          properties:
-            email:
-              type: string
-              description: User email.
-            password:
-              type: string
-              description: User password.
-    responses:
-      200:
-        description: Login successful.
-        schema:
-          type: object
-      401:
-        description: Authentication failed.
-        schema:
-          type: object
+    用户登录端点。
+
+    支持邮箱+密码登录，密码经 base64 加密传输。
+    登录成功后返回用户信息及 access_token。
     """
     json_body = await get_request_json()
     if not json_body:
@@ -142,9 +135,7 @@ async def login():
 
 @manager.route("/auth/login/channels", methods=["GET"])  # noqa: F821
 async def get_login_channels():
-    """
-    Get all supported authentication channels.
-    """
+    """获取所有已配置的第三方认证渠道（OAuth/OIDC）。"""
     try:
         channels = []
         for channel, config in settings.OAUTH_CONFIG.items():
@@ -163,6 +154,7 @@ async def get_login_channels():
 
 @manager.route("/auth/login/<channel>", methods=["GET"])  # noqa: F821
 async def oauth_login(channel):
+    """OAuth/OIDC 第三方登录入口，重定向到认证提供方的授权页面。"""
     channel_config = settings.OAUTH_CONFIG.get(channel)
     if not channel_config:
         raise ValueError(f"Invalid channel name: {channel}")
@@ -177,9 +169,7 @@ async def oauth_login(channel):
 
 @manager.route("/auth/oauth/<channel>/callback", methods=["GET"])  # noqa: F821
 async def oauth_callback(channel):
-    """
-    Handle the OAuth/OIDC callback for various channels dynamically.
-    """
+    """OAuth/OIDC 回调处理 — 验证 state、换取 token、获取用户信息并登录或自动注册。"""
     try:
         channel_config = settings.OAUTH_CONFIG.get(channel)
         if not channel_config:
@@ -273,19 +263,7 @@ async def oauth_callback(channel):
 @manager.route("/auth/logout", methods=["POST"])  # noqa: F821
 @login_required
 async def log_out():
-    """
-    User logout endpoint.
-    ---
-    tags:
-      - User
-    security:
-      - ApiKeyAuth: []
-    responses:
-      200:
-        description: Logout successful.
-        schema:
-          type: object
-    """
+    """用户登出 — 使 access_token 失效并清除登录会话。"""
     user = current_user._get_current_object() if hasattr(current_user, "_get_current_object") else current_user
     user_id = user.id
     user.access_token = f"INVALID_{secrets.token_hex(16)}"
@@ -301,33 +279,7 @@ async def log_out():
 @manager.route("/users/me", methods=["PATCH"])  # noqa: F821
 @login_required
 async def setting_user():
-    """
-    Update user settings.
-    ---
-    tags:
-      - User
-    security:
-      - ApiKeyAuth: []
-    parameters:
-      - in: body
-        name: body
-        description: User settings to update.
-        required: true
-        schema:
-          type: object
-          properties:
-            nickname:
-              type: string
-              description: New nickname.
-            email:
-              type: string
-              description: New email.
-    responses:
-      200:
-        description: Settings updated successfully.
-        schema:
-          type: object
-    """
+    """更新当前用户设置（昵称、密码等），密码修改需先验证旧密码。"""
     update_dict = {}
     request_data = await get_request_json()
     if request_data.get("password"):
@@ -375,33 +327,12 @@ async def setting_user():
 @manager.route("/users/me", methods=["GET"])  # noqa: F821
 @login_required
 async def user_profile():
-    """
-    Get user profile information.
-    ---
-    tags:
-      - User
-    security:
-      - ApiKeyAuth: []
-    responses:
-      200:
-        description: User profile retrieved successfully.
-        schema:
-          type: object
-          properties:
-            id:
-              type: string
-              description: User ID.
-            nickname:
-              type: string
-              description: User nickname.
-            email:
-              type: string
-              description: User email.
-    """
+    """获取当前用户的个人信息（ID、昵称、邮箱等）。"""
     return get_json_result(data=current_user.to_safe_dict(for_self=True))
 
 
 def rollback_user_registration(user_id):
+    """注册失败时回滚：依次删除已创建的 User、Tenant、UserTenant 记录。"""
     try:
         UserService.delete_by_id(user_id)
     except Exception:
@@ -419,6 +350,11 @@ def rollback_user_registration(user_id):
 
 
 def user_register(user_id, user):
+    """创建新用户及其个人租户，初始化文件根目录和用户-租户关联。
+
+    返回 UserService 查询到的用户列表；失败时调用方应调用
+    ``rollback_user_registration`` 清理残留数据。
+    """
     user["id"] = user_id
     tenant = {
         "id": user_id,
@@ -462,34 +398,7 @@ def user_register(user_id, user):
 @manager.route("/users", methods=["POST"])  # noqa: F821
 @validate_request("nickname", "email", "password")
 async def user_add():
-    """
-    Register a new user.
-    ---
-    tags:
-      - User
-    parameters:
-      - in: body
-        name: body
-        description: Registration details.
-        required: true
-        schema:
-          type: object
-          properties:
-            nickname:
-              type: string
-              description: User nickname.
-            email:
-              type: string
-              description: User email.
-            password:
-              type: string
-              description: User password.
-    responses:
-      200:
-        description: Registration successful.
-        schema:
-          type: object
-    """
+    """注册新用户 — 校验邮箱格式和唯一性，创建用户及个人租户，自动登录。"""
 
     if not settings.REGISTER_ENABLED:
         return get_json_result(
@@ -561,32 +470,7 @@ async def user_add():
 @manager.route("/users/me/models", methods=["GET"])  # noqa: F821
 @login_required
 async def tenant_info():
-    """
-    Get tenant information.
-    ---
-    tags:
-      - Tenant
-    security:
-      - ApiKeyAuth: []
-    responses:
-      200:
-        description: Tenant information retrieved successfully.
-        schema:
-          type: object
-          properties:
-            tenant_id:
-              type: string
-              description: Tenant ID.
-            name:
-              type: string
-              description: Tenant name.
-            llm_id:
-              type: string
-              description: LLM ID.
-            embd_id:
-              type: string
-              description: Embedding model ID.
-    """
+    """获取当前用户所属租户的模型配置信息（LLM、Embedding、ASR 等）。"""
     try:
         tenants = TenantService.get_info_by(current_user.id)
         if not tenants:
@@ -600,42 +484,7 @@ async def tenant_info():
 @login_required
 @validate_request("tenant_id", "asr_id", "embd_id", "img2txt_id", "llm_id")
 async def set_tenant_info():
-    """
-    Update tenant information.
-    ---
-    tags:
-      - Tenant
-    security:
-      - ApiKeyAuth: []
-    parameters:
-      - in: body
-        name: body
-        description: Tenant information to update.
-        required: true
-        schema:
-          type: object
-          properties:
-            tenant_id:
-              type: string
-              description: Tenant ID.
-            llm_id:
-              type: string
-              description: LLM ID.
-            embd_id:
-              type: string
-              description: Embedding model ID.
-            asr_id:
-              type: string
-              description: ASR model ID.
-            img2txt_id:
-              type: string
-              description: Image to Text model ID.
-    responses:
-      200:
-        description: Tenant information updated successfully.
-        schema:
-          type: object
-    """
+    """更新租户的模型配置（LLM、Embedding、ASR、Image2Text、Rerank 等）。"""
     req = await get_request_json()
     try:
         tid = req.pop("tenant_id")
@@ -647,10 +496,9 @@ async def set_tenant_info():
 
 @manager.route("/auth/password/forgot/captcha", methods=["POST"])  # noqa: F821
 async def forget_get_captcha():
-    """
-    GET /forget/captcha?email=<email>
-    - Generate an image captcha and cache it in Redis under key captcha:{email} with TTL = OTP_TTL_SECONDS.
-    - Returns the captcha as a PNG image.
+    """忘记密码第一步：生成图形验证码图片并缓存到 Redis（key 为 captcha:{email}，有效期 60 秒）。
+
+    返回 JPEG 图片。
     """
     email = (request.args.get("email") or "")
     if not email:
@@ -675,10 +523,13 @@ async def forget_get_captcha():
 
 @manager.route("/auth/password/forgot/otp", methods=["POST"])  # noqa: F821
 async def forget_send_otp():
-    """
-    POST /forget/otp
-    - Verify the image captcha stored at captcha:{email} (case-insensitive).
-    - On success, generate an email OTP (A–Z with length = OTP_LENGTH), store hash + salt (and timestamp) in Redis with TTL, reset attempts and cooldown, and send the OTP via email.
+    """忘记密码第二步：校验图形验证码，通过后生成邮箱 OTP 验证码并发送邮件。
+
+    流程：
+    1. 验证图形验证码（大小写不敏感），验证后删除防止重用。
+    2. 检查重发冷却时间。
+    3. 生成大写字母 OTP，存储 hash+salt 到 Redis。
+    4. 通过邮件发送 OTP。
     """
     req = await get_request_json()
     email = req.get("email") or ""
@@ -740,15 +591,19 @@ async def forget_send_otp():
 
 
 def _verified_key(email: str) -> str:
+    """返回 OTP 验证通过后 Redis 标记的键名。"""
     return f"otp:verified:{email}"
 
 
 @manager.route("/auth/password/forgot/otp/verify", methods=["POST"])  # noqa: F821
 async def forget_verify_otp():
-    """
-    Verify email + OTP only. On success:
-    - consume the OTP and attempt counters
-    - set a short-lived verified flag in Redis for the email
+    """忘记密码第三步：验证邮箱 OTP。
+
+    成功后：
+    - 删除 OTP 和尝试计数器。
+    - 在 Redis 中设置已验证标记（``_verified_key``），供重置密码步骤使用。
+    失败次数达到上限时锁定一段时间。
+
     Request JSON: { email, otp }
     """
     req = await get_request_json()
@@ -806,14 +661,16 @@ async def forget_verify_otp():
 
 @manager.route("/auth/password/reset", methods=["POST"])  # noqa: F821
 async def forget_reset_password():
-    """
-    Reset password after successful OTP verification.
-    Requires: { email, new_password, confirm_new_password }
-    Steps:
-    - check verified flag in Redis
-    - update user password
-    - auto login
-    - clear verified flag
+    """忘记密码第四步：重置密码。
+
+    要求 OTP 已验证（Redis 中存在 ``_verified_key`` 标记）。
+    步骤：
+    1. 校验 Redis 中的已验证标记。
+    2. 解密并比对两次输入的新密码。
+    3. 更新密码。
+    4. 清除已验证标记，自动登录。
+
+    Request JSON: { email, new_password, confirm_new_password }
     """
     
     req = await get_request_json()
