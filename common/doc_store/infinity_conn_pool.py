@@ -27,6 +27,14 @@ from common.decorator import singleton
 
 @singleton
 class InfinityConnectionPool:
+    """Infinity 数据库连接池（单例模式）。
+
+    管理与 Infinity 向量数据库的连接池，包括：
+    - 连接池初始化（带健康检查，最多重试 120 秒）
+    - 连接池大小配置（通过 INFINITY_POOL_MAX_SIZE 环境变量）
+    - 连接获取、刷新和销毁
+    - PostgreSQL 协议连接 URI 获取（供 psql 命令行使用）
+    """
 
     def __init__(self):
         if hasattr(settings, "INFINITY"):
@@ -81,11 +89,12 @@ class InfinityConnectionPool:
         logging.info(f"Infinity {infinity_uri} is healthy. Connection pool max_size={self.pool_max_size}")
 
     def get_conn_pool(self):
+        """获取当前连接池实例。"""
         return self.conn_pool
 
     def get_conn_uri(self):
         """
-        Get connection URI for PostgreSQL protocol.
+        获取 PostgreSQL 协议的连接 URI，供 psql 命令行使用。
         """
         infinity_uri = self.INFINITY_CONFIG["uri"]
         postgres_port = self.INFINITY_CONFIG["postgres_port"]
@@ -97,6 +106,7 @@ class InfinityConnectionPool:
         return f"host=localhost port={postgres_port} dbname={db_name}"
 
     def refresh_conn_pool(self):
+        """刷新连接池：检查现有连接健康状态，不健康则销毁后重建。"""
         try:
             inf_conn = self.conn_pool.get_conn()
             res = inf_conn.show_current_node()
@@ -113,8 +123,10 @@ class InfinityConnectionPool:
                 return self.conn_pool
 
     def __del__(self):
+        """析构时销毁连接池。"""
         if hasattr(self, "conn_pool") and self.conn_pool:
             self.conn_pool.destroy()
 
 
+# 全局单例：Infinity 连接池实例
 INFINITY_CONN = InfinityConnectionPool()

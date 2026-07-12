@@ -33,6 +33,15 @@ logger = logging.getLogger('ragflow.ob_conn_pool')
 
 @singleton
 class OceanBaseConnectionPool:
+    """OceanBase 连接池（单例模式）。
+
+    管理与 OceanBase 数据库的连接，包括：
+    - ObVecClient 客户端（向量检索）
+    - HybridSearch 客户端（混合搜索，可选）
+    - 版本校验（要求 >= 4.3.5.1）
+    - 查询超时设置
+    - 连接健康检查和刷新
+    """
 
     def __init__(self):
         self.client = None
@@ -100,6 +109,7 @@ class OceanBaseConnectionPool:
         logger.info(f"OceanBase {self.uri} is healthy.")
 
     def _check_ob_version(self):
+        """检查 OceanBase 版本，要求 >= 4.3.5.1。"""
         try:
             res = self.client.perform_raw_text_sql("SELECT OB_VERSION() FROM DUAL").fetchone()
             version_str = res[0] if res else None
@@ -117,6 +127,7 @@ class OceanBaseConnectionPool:
             )
 
     def _try_to_update_ob_query_timeout(self):
+        """尝试设置 OceanBase 查询超时时间（OB_QUERY_TIMEOUT 环境变量）。"""
         try:
             rows = self.client.perform_raw_text_sql("SHOW VARIABLES LIKE 'ob_query_timeout'")
             for row in rows:
@@ -135,6 +146,7 @@ class OceanBaseConnectionPool:
             logger.warning(f"Failed to set 'ob_query_timeout' variable: {str(e)}")
 
     def _init_hybrid_search(self, max_connections, max_overflow, pool_timeout):
+        """初始化混合搜索客户端（需 ENABLE_HYBRID_SEARCH=true）。"""
         enable_hybrid_search = os.getenv('ENABLE_HYBRID_SEARCH', 'false').lower() in ['true', '1', 'yes', 'y']
         if enable_hybrid_search:
             try:
@@ -155,18 +167,23 @@ class OceanBaseConnectionPool:
                 self.es = None
 
     def get_client(self) -> ObVecClient:
+        """获取 ObVecClient 客户端实例。"""
         return self.client
 
     def get_hybrid_search_client(self) -> HybridSearch | None:
+        """获取 HybridSearch 客户端实例（如未启用则返回 None）。"""
         return self.es
 
     def get_db_name(self) -> str:
+        """获取数据库名称。"""
         return self.db_name
 
     def get_uri(self) -> str:
+        """获取连接 URI。"""
         return self.uri
 
     def refresh_client(self) -> ObVecClient:
+        """刷新客户端连接：执行健康检查，不健康则 dispose 连接池。"""
         try:
             self.client.perform_raw_text_sql("SELECT 1 FROM DUAL")
             return self.client
@@ -176,6 +193,7 @@ class OceanBaseConnectionPool:
             return self.client
 
     def __del__(self):
+        """析构时释放 ObVecClient 和 HybridSearch 的连接池。"""
         if hasattr(self, "client") and self.client:
             try:
                 self.client.engine.dispose()
@@ -188,4 +206,5 @@ class OceanBaseConnectionPool:
                 pass
 
 
+# 全局单例：OceanBase 连接池实例
 OB_CONN = OceanBaseConnectionPool()

@@ -34,6 +34,9 @@ from common import settings
 
 ATTEMPT_TIME = 2
 
+# 单文档 pagerank_fea 原子调整脚本（Painless 脚本）。
+# 对指定 chunk 的 pagerank 特征字段进行增减操作，结果钳制在 [min_w, max_w] 范围内；
+# 当值降到 ≤0 时自动移除字段，以兼容 rank_feature 查询。
 _PAGERANK_FEA_ADJUST_SCRIPT = """
 double cur = 0.0;
 if (ctx._source.containsKey(params.pf)) {
@@ -63,6 +66,16 @@ logger = logging.getLogger('ragflow.opensearch_conn')
 
 @singleton
 class OSConnection(DocStoreConnection):
+    """OpenSearch 文档存储连接（单例模式）。
+
+    为 OpenSearch 提供与 Elasticsearch 兼容的文档存储接口，包括：
+    - 连接管理（带重试和版本校验，要求 >= 2.x）
+    - 混合搜索 pipeline 初始化（需 >= 2.10）
+    - 索引/表的 CRUD 操作
+    - 混合检索（全文 BM25 + 向量 KNN）
+    - SQL 查询支持（Text-to-SQL）
+    """
+
     def __init__(self):
         self.info = {}
         logger.info(f"Use OpenSearch {settings.OS['hosts']} as the doc engine.")
@@ -101,11 +114,16 @@ class OSConnection(DocStoreConnection):
         logger.info(f"OpenSearch {settings.OS['hosts']} is healthy.")
         self._init_hybrid_search()
 
-    # normalization-processor (needed to merge the BM25 and KNN scores) only
-    # exists on OpenSearch 2.10+.
+    # normalization-processor（用于合并 BM25 和 KNN 分数）仅在 OpenSearch 2.10+ 上可用。
     HYBRID_MIN_VERSION = (2, 10)
 
     def _init_hybrid_search(self):
+        """初始化 OpenSearch 混合搜索 pipeline。
+
+        创建名为 ragflow_hybrid_pipeline 的 search pipeline，使用 normalization-processor
+        对 BM25 全文检索和 KNN 向量检索的结果进行归一化，然后通过加权算术平均合并分数。
+        如果 OpenSearch 版本低于 2.10 或无权限创建 pipeline，则降级为纯向量检索。
+        """
         """Create the hybrid-search pipeline if it isn't there yet.
 
         A {"hybrid": {...}} query is scored by a normalization-processor that has
@@ -157,22 +175,25 @@ class OSConnection(DocStoreConnection):
                            f"locked-down or managed OpenSearch).", exc_info=True)
 
     """
-    Database operations
+    数据库级操作
     """
 
     def db_type(self) -> str:
+        """返回数据库类型标识。"""
         return "opensearch"
 
     def health(self) -> dict:
+        """返回集群健康状态。"""
         health_dict = dict(self.os.cluster.health())
         health_dict["type"] = "opensearch"
         return health_dict
 
     """
-    Table operations
+    索引 / 表操作
     """
 
     def create_idx(self, indexName: str, knowledgebaseId: str, vectorSize: int, parser_id: str = None):
+        """创建索引。如果索引已存在则跳过。"""
         if self.index_exist(indexName, knowledgebaseId):
             return True
         try:
@@ -184,11 +205,13 @@ class OSConnection(DocStoreConnection):
 
     def create_doc_meta_idx(self, index_name: str):
         """
-        Create a per-tenant document metadata index on OpenSearch.
+        创建租户级别的文档元数据索引。
 
-        Mirrors ESConnectionBase.create_doc_meta_idx so that the
-        DocMetadataService dispatches uniformly across ES and OS backends.
-        Index name pattern: ragflow_doc_meta_{tenant_id}
+        与 ESConnectionBase.create_doc_meta_idx 保持一致，使 DocMetadataService
+        可以在 ES 和 OS 后端之间统一调度。
+        索引命名模式：ragflow_doc_meta_{tenant_id}
+
+        注意：OpenSearch 不支持 runtime fields，需要将 dynamic 从 "runtime" 回退为 true。
         """
         if self.index_exist(index_name, ""):
             return True
@@ -226,12 +249,9 @@ class OSConnection(DocStoreConnection):
 
     def refresh_idx(self, index_name: str) -> bool:
         """
-        Refresh an index so that recently inserted documents become searchable.
+        刷新索引，使最近插入的文档立即可搜索。
 
-        DocMetadataService used to call ``settings.docStoreConn.es.indices.refresh``
-        directly, which raised AttributeError on the OpenSearch backend because
-        OSConnection exposes ``self.os`` rather than ``self.es``. This wrapper
-        gives both backends a uniform abstract entry point.
+        统一 ES 和 OS 后端的刷新入口，避免调用方直接访问 self.os.indices.refresh。
         """
         try:
             self.os.indices.refresh(index=index_name)
@@ -244,10 +264,9 @@ class OSConnection(DocStoreConnection):
 
     def count_idx(self, index_name: str) -> int:
         """
-        Return the document count for an index, or -1 if the call fails.
+        返回索引中的文档数量，调用失败时返回 -1。
 
-        Used by DocMetadataService._drop_empty_metadata_table to decide whether
-        a per-tenant metadata index is empty without paying a full search.
+        用于 DocMetadataService 判断租户元数据索引是否为空（避免执行完整搜索）。
         """
         try:
             response = self.os.count(index=index_name)
@@ -260,13 +279,10 @@ class OSConnection(DocStoreConnection):
 
     def replace_meta_fields(self, index_name: str, doc_id: str, meta_fields: dict) -> bool:
         """
-        Replace the ``meta_fields`` object on a single document.
+        替换单个文档的 meta_fields 对象。
 
-        ES.update with a ``doc`` body deep-merges object fields, which retains
-        old keys that should be removed. The fix in ESConnection is a script
-        that fully assigns the new meta_fields. We provide the same primitive
-        on OpenSearch so the service layer never reaches into ``self.es`` or
-        ``self.os`` directly.
+        使用脚本赋值而非 doc 参数，避免 ES/OS update 的深度合并行为
+        （deep-merge 会保留本应删除的旧键）。
         """
         body = {
             "script": {
@@ -289,8 +305,9 @@ class OSConnection(DocStoreConnection):
         return False
 
     def delete_idx(self, indexName: str, knowledgebaseId: str):
+        """删除索引。如果指定了知识库 ID 则跳过（同一租户下的所有知识库共享一个索引）。"""
         if len(knowledgebaseId) > 0:
-            # The index need to be alive after any kb deletion since all kb under this tenant are in one index.
+            # 同一租户下的所有知识库共享一个索引，删除单个知识库时不能删除索引
             return
         try:
             self.os.indices.delete(index=indexName, allow_no_indices=True)
@@ -300,6 +317,7 @@ class OSConnection(DocStoreConnection):
             logger.exception("OSConnection.deleteIdx error %s" % (indexName))
 
     def index_exist(self, indexName: str, knowledgebaseId: str = None) -> bool:
+        """检查索引是否存在（带重试）。"""
         s = Index(indexName, self.os)
         for i in range(ATTEMPT_TIME):
             try:
@@ -312,7 +330,7 @@ class OSConnection(DocStoreConnection):
         return False
 
     """
-    CRUD operations
+    CRUD 操作
     """
 
     def search(
@@ -501,6 +519,7 @@ class OSConnection(DocStoreConnection):
         raise Exception("OSConnection.search timeout.")
 
     def get(self, chunkId: str, indexName: str, knowledgebaseIds: list[str]) -> dict | None:
+        """根据文档 ID 获取单个 chunk（带重试）。"""
         for i in range(ATTEMPT_TIME):
             try:
                 res = self.os.get(index=(indexName),
@@ -521,6 +540,11 @@ class OSConnection(DocStoreConnection):
         raise Exception("OSConnection.get timeout.")
 
     def insert(self, documents: list[dict], indexName: str, knowledgebaseId: str = None) -> list[str]:
+        """批量插入文档到 OpenSearch 索引。
+
+        使用 bulk API，refresh="wait_for" 确保插入后立即可查。
+        返回错误列表，空列表表示全部成功。
+        """
         # Refers to https://opensearch.org/docs/latest/api-reference/document-apis/bulk/
         operations = []
         for d in documents:
@@ -560,6 +584,13 @@ class OSConnection(DocStoreConnection):
         return res
 
     def update(self, condition: dict, newValue: dict, indexName: str, knowledgebaseId: str) -> bool:
+        """
+        更新 OpenSearch 中的文档。
+
+        支持两种模式：
+        - 单文档更新：通过 id 精确更新，支持 remove（删除字段/数组元素）、add（添加数组元素）和普通字段更新
+        - 批量更新：通过布尔查询匹配多个文档，使用 UpdateByQuery + Painless 脚本执行
+        """
         doc = copy.deepcopy(newValue)
         doc.pop("id", None)
         if "id" in condition and isinstance(condition["id"], str):
@@ -680,7 +711,11 @@ class OSConnection(DocStoreConnection):
         max_w: float = 100.0,
         row_id: int | None = None,
     ) -> bool:
-        """Atomically adjust pagerank_fea on one chunk (painless script)."""
+        """原子性地调整单个 chunk 的 pagerank_fea 值（Painless 脚本）。
+
+        通过 update API 执行无痛脚本，对指定 chunk 的 pagerank 特征字段
+        进行增减操作，结果钳制在 [min_w, max_w] 范围内。
+        """
         _ = row_id
         try:
             self.os.update(
@@ -717,13 +752,21 @@ class OSConnection(DocStoreConnection):
         return False
 
     def delete(self, condition: dict, indexName: str, knowledgebaseId: str) -> int:
+        """
+        OpenSearch 删除操作的实现。
+
+        使用 delete_by_query 批量删除匹配文档，支持：
+        - 精确 ID 删除、多条件组合删除、must_not 否定条件
+        - 带重试机制：连接超时自动重试，索引不存在返回 0
+        """
         assert "_id" not in condition
+        # 强制添加 kb_id 条件，确保多租户数据隔离
         condition["kb_id"] = knowledgebaseId
 
-        # Build a bool query that combines id filter with other conditions
+        # 构建布尔查询（组合 ID 过滤和其他条件）
         bool_query = Q("bool")
 
-        # Handle chunk IDs if present
+        # 处理 chunk ID（特殊逻辑：使用 ids 查询精确匹配）
         if "id" in condition:
             chunk_ids = condition["id"]
             if not isinstance(chunk_ids, list):
@@ -775,24 +818,25 @@ class OSConnection(DocStoreConnection):
         return 0
 
     """
-    Helper functions for search result
+    搜索结果的辅助函数
     """
 
     def get_total(self, res):
+        """从搜索结果中提取命中总数。"""
         if isinstance(res["hits"]["total"], type({})):
             return res["hits"]["total"]["value"]
         return res["hits"]["total"]
 
     def get_doc_ids(self, res):
+        """从搜索结果中提取所有文档的 _id 列表。"""
         return [d["_id"] for d in res["hits"]["hits"]]
 
     def get_scores(self, res) -> dict[str, float]:
         """
-        Map hit `_id` to its raw `_score`. Used by rag/nlp/search.py:_knn_scores()
-        to recover the cosine similarity returned by a KNN-only second-pass search
-        without pulling the chunk vectors out of the index. OpenSearch hit headers
-        carry `_score` exactly like Elasticsearch, so this mirrors
-        ESConnectionBase.get_scores.
+        将命中结果的 _id 映射到其原始 _score。
+
+        用于 rag/nlp/search.py:_knn_scores() 恢复 KNN 搜索的余弦相似度，
+        无需从索引中取出 chunk 向量。
         """
         out = {}
         for d in res.get("hits", {}).get("hits", []):
@@ -804,6 +848,7 @@ class OSConnection(DocStoreConnection):
         return out
 
     def __getSource(self, res):
+        """从搜索结果中提取 _source 数据，并附加 id 和 _score 字段。"""
         rr = []
         for d in res["hits"]["hits"]:
             d["_source"]["id"] = d["_id"]
@@ -812,6 +857,7 @@ class OSConnection(DocStoreConnection):
         return rr
 
     def get_fields(self, res, fields: list[str]) -> dict[str, dict]:
+        """从搜索结果中提取指定字段。返回以文档 id 为键、字段名值对为值的字典。"""
         res_fields = {}
         if not fields:
             return {}
@@ -831,6 +877,7 @@ class OSConnection(DocStoreConnection):
         return res_fields
 
     def get_highlight(self, res, keywords: list[str], fieldnm: str):
+        """从搜索结果中提取高亮片段。对英文按句子分割后匹配关键词，用 <em> 标签包裹。"""
         ans = {}
         for d in res["hits"]["hits"]:
             hlts = d.get("highlight")
@@ -856,6 +903,7 @@ class OSConnection(DocStoreConnection):
         return ans
 
     def get_aggregation(self, res, fieldnm: str):
+        """从搜索结果中提取聚合桶数据，返回 (key, doc_count) 列表。"""
         agg_field = "aggs_" + fieldnm
         if "aggregations" not in res or agg_field not in res["aggregations"]:
             return list()
@@ -863,10 +911,14 @@ class OSConnection(DocStoreConnection):
         return [(b["key"], b["doc_count"]) for b in bkts]
 
     """
-    SQL
+    SQL 查询（Text-to-SQL 场景）
+
+    将类 SQL 查询转换为 OpenSearch 的 SQL 方言执行。会预处理分词列
+    （*_tks/*_ltks）的 LIKE 查询为 MATCH 函数调用。
     """
 
     def sql(self, sql: str, fetch_size: int, format: str):
+        """执行 SQL 查询。将分词列 LIKE 查询转换为 OpenSearch MATCH 函数。"""
         logger.debug(f"OSConnection.sql get sql: {sql}")
         sql = re.sub(r"[ `]+", " ", sql)
         sql = sql.replace("%", "")

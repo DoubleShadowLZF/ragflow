@@ -31,14 +31,14 @@ from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, Order
 
 ATTEMPT_TIME = 2
 
-# Common templates for OceanBase
-index_name_template = "ix_%s_%s"
-fulltext_index_name_template = "fts_idx_%s"
-fulltext_search_template = "MATCH (%s) AGAINST ('%s' IN NATURAL LANGUAGE MODE)"
-vector_search_template = "cosine_distance(%s, '%s')"
-vector_column_pattern = re.compile(r"q_(?P<vector_size>\d+)_vec")
+# OceanBase 通用模板
+index_name_template = "ix_%s_%s"                                 # 普通索引名称模板
+fulltext_index_name_template = "fts_idx_%s"                       # 全文索引名称模板
+fulltext_search_template = "MATCH (%s) AGAINST ('%s' IN NATURAL LANGUAGE MODE)"  # 全文搜索 SQL 模板
+vector_search_template = "cosine_distance(%s, '%s')"              # 向量搜索 SQL 模板
+vector_column_pattern = re.compile(r"q_(?P<vector_size>\d+)_vec") # 向量列名模式
 
-# Document metadata table columns
+# 文档元数据表列定义
 doc_meta_columns = [
     Column("id", VARCHAR(256), primary_key=True, comment="document id"),
     Column("kb_id", VARCHAR(256), nullable=False, comment="knowledge base id"),
@@ -49,7 +49,10 @@ doc_meta_column_types = {col.name: col.type for col in doc_meta_columns}
 
 
 def get_value_str(value: Any) -> str:
-    """Convert value to SQL string representation."""
+    """将 Python 值转换为 SQL 字符串表示形式。
+
+    自动处理字符串转义、布尔值、NULL、JSON 等类型。
+    """
     if isinstance(value, str):
         # escape_string already handles all necessary escaping for MySQL/OceanBase
         # including backslashes, quotes, newlines, etc.
@@ -66,7 +69,11 @@ def get_value_str(value: Any) -> str:
 
 
 def _try_with_lock(lock_name: str, process_func, check_func, timeout: int = None):
-    """Execute function with distributed lock."""
+    """在分布式锁保护下执行函数。
+
+    用于 OceanBase DDL 操作的并发控制，多进程/多节点场景下避免重复建表/建索引。
+    使用 Redis 分布式锁，失败时轮询等待直到超时。
+    """
     if not timeout:
         timeout = int(os.environ.get("OB_DDL_TIMEOUT", "60"))
 
@@ -95,7 +102,17 @@ def _try_with_lock(lock_name: str, process_func, check_func, timeout: int = None
 
 
 class OBConnectionBase(DocStoreConnection):
-    """Base class for OceanBase document store connections."""
+    """OceanBase 文档存储连接基类。
+
+    使用模板方法模式，子类只需实现索引列名、全文索引列名和列定义等抽象方法。
+    通过分布式锁（Redis）保证多节点并发 DDL 的安全性。
+
+    核心功能：
+    - 表和索引的创建/删除（自动创建普通索引、全文索引和向量索引）
+    - 向量列的按需添加和索引
+    - 全文搜索和向量搜索的 SQL 构建
+    - 搜索结果转换
+    """
 
     def __init__(self, logger_name: str = 'ragflow.ob_conn'):
         from common.doc_store.ob_conn_pool import OB_CONN
@@ -133,7 +150,7 @@ class OBConnectionBase(DocStoreConnection):
             self.search_original_content = False
 
     """
-    Template methods - must be implemented by subclasses
+    模板方法 —— 子类必须实现
     """
 
     @abstractmethod
@@ -165,7 +182,7 @@ class OBConnectionBase(DocStoreConnection):
         raise NotImplementedError("Not implemented")
 
     """
-    Database operations
+    数据库级操作
     """
 
     def db_type(self) -> str:
@@ -184,7 +201,7 @@ class OBConnectionBase(DocStoreConnection):
         raise Exception(f"Variable '{var_name}' not found.")
 
     """
-    Table operations - common implementation using template methods
+    表操作 —— 使用模板方法模式的通用实现
     """
 
     def _check_table_exists_cached(self, table_name: str) -> bool:
@@ -333,7 +350,7 @@ class OBConnectionBase(DocStoreConnection):
         return self._check_table_exists_cached(table_name)
 
     """
-    Table operations - helper methods
+    表操作 —— 辅助方法
     """
 
     def _get_count(self, table_name: str, filter_list: list[str] = None) -> int:
@@ -683,7 +700,7 @@ class OBConnectionBase(DocStoreConnection):
         return 0
 
     """
-    Abstract CRUD methods that must be implemented by subclasses
+    抽象 CRUD 方法 —— 子类必须实现
     """
 
     @abstractmethod
@@ -713,7 +730,7 @@ class OBConnectionBase(DocStoreConnection):
         raise NotImplementedError("Not implemented")
 
     """
-    Helper functions for search result - abstract methods
+    搜索结果的辅助函数 —— 抽象方法
     """
 
     @abstractmethod
@@ -737,7 +754,7 @@ class OBConnectionBase(DocStoreConnection):
         raise NotImplementedError("Not implemented")
 
     """
-    SQL - can be overridden by subclasses
+    SQL 查询 —— 可由子类覆写
     """
 
     def sql(self, sql: str, fetch_size: int, format: str):

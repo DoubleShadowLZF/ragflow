@@ -25,6 +25,13 @@ ATTEMPT_TIME = 2
 
 @singleton
 class ElasticSearchConnectionPool:
+    """Elasticsearch 连接池（单例模式）。
+
+    负责管理与 ES 集群的连接，包括：
+    - 初始化连接（带重试和健康检查）
+    - 版本校验（要求 >= 8.x）
+    - 连接获取、刷新和关闭
+    """
 
     def __init__(self):
         if hasattr(settings, "ES"):
@@ -52,6 +59,7 @@ class ElasticSearchConnectionPool:
             raise Exception(msg)
 
     def _connect(self):
+        """建立到 ES 集群的实际连接。"""
         self.es_conn = Elasticsearch(
             self.ES_CONFIG["hosts"].split(","),
             basic_auth=(self.ES_CONFIG["username"], self.ES_CONFIG[
@@ -64,21 +72,25 @@ class ElasticSearchConnectionPool:
         return False
 
     def get_conn(self):
+        """获取当前 ES 连接实例。"""
         return self.es_conn
 
     def refresh_conn(self):
+        """刷新 ES 连接：若当前连接不健康则关闭后重建。"""
         if self.es_conn.ping():
             return self.es_conn
         else:
-            # close current if exist
+            # 关闭当前连接（如果存在）
             if self.es_conn:
                 self.es_conn.close()
             self._connect()
             return self.es_conn
 
     def __del__(self):
+        """析构时关闭 ES 连接。"""
         if hasattr(self, "es_conn") and self.es_conn:
             self.es_conn.close()
 
 
+# 全局单例：ES 连接池实例
 ES_CONN = ElasticSearchConnectionPool()

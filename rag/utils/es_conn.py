@@ -626,7 +626,12 @@ class ESConnection(ESConnectionBase):
         max_w: float = 100.0,
         row_id: int | None = None,
     ) -> bool:
-        """Atomically adjust pagerank_fea on one chunk (painless script)."""
+        """原子性地调整单个 chunk 的 pagerank_fea 值（使用 Painless 脚本）。
+
+        通过 ES 的 update API 执行无痛脚本，对指定 chunk 的 pagerank 特征字段
+        进行增减操作，结果会被钳制在 [min_w, max_w] 范围内。
+        当值降到 ≤0 时自动移除字段，以兼容 rank_feature 查询。
+        """
         _ = row_id
         for _ in range(ATTEMPT_TIME):
             try:
@@ -767,10 +772,15 @@ class ESConnection(ESConnectionBase):
         return 0
 
     """
-    Helper functions for search result
+    搜索结果的辅助函数
     """
 
     def get_fields(self, res, fields: list[str]) -> dict[str, dict]:
+        """从 ES 搜索结果中提取指定字段。
+
+        优先从 _source 获取，其次从 fields（ES 9.x 的 dense_vector 存储位置）获取。
+        返回以文档 _id 为键、字段名值对为值的字典。
+        """
         res_fields = {}
         if not fields:
             return {}

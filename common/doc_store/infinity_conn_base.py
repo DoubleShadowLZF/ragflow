@@ -146,6 +146,16 @@ def _retry_on_meta_contention(
 
 
 class InfinityConnectionBase(DocStoreConnection):
+    """Infinity 文档存储连接基类。
+
+    提供 Infinity 向量数据库作为文档存储引擎的通用实现，包括：
+    - 数据库迁移（自动添加新列和索引）
+    - 表/索引的创建（带 RocksDB 元数据竞争重试）
+    - 条件到 SQL 过滤表达式的转换
+    - SQL 查询支持（通过 psql 命令行）
+    - 搜索结果的手动聚合和高亮处理
+    """
+
     def __init__(self, mapping_file_name: str = "infinity_mapping.json", logger_name: str = "ragflow.infinity_conn", table_name_prefix: str="ragflow_"):
         from common.doc_store.infinity_conn_pool import INFINITY_CONN
 
@@ -241,7 +251,7 @@ class InfinityConnectionBase(DocStoreConnection):
                             self.logger.info(f"INFINITY created secondary index sec_{field_name} for field {field_name} with params {params}")
 
     """
-    Dataframe and fields convert
+    DataFrame 与字段转换
     """
 
     @staticmethod
@@ -355,7 +365,7 @@ class InfinityConnectionBase(DocStoreConnection):
         return pd.DataFrame(columns=schema)
 
     """
-    Database operations
+    数据库级操作
     """
 
     def db_type(self) -> str:
@@ -378,7 +388,7 @@ class InfinityConnectionBase(DocStoreConnection):
             self.connPool.release_conn(inf_conn)
 
     """
-    Table operations
+    表操作（创建、删除、存在性检查）
     """
 
     def create_idx(self, index_name: str, dataset_id: str, vector_size: int, parser_id: str = None):
@@ -600,7 +610,7 @@ class InfinityConnectionBase(DocStoreConnection):
             self.connPool.release_conn(inf_conn)
 
     """
-    CRUD operations
+    CRUD 操作
     """
 
     @abstractmethod
@@ -653,7 +663,7 @@ class InfinityConnectionBase(DocStoreConnection):
             self.connPool.release_conn(inf_conn)
 
     """
-    Helper functions for search result
+    搜索结果的辅助函数
     """
 
     def get_total(self, res: tuple[pd.DataFrame, int] | pd.DataFrame) -> int:
@@ -771,7 +781,7 @@ class InfinityConnectionBase(DocStoreConnection):
         return [[tag, count] for tag, count in tag_counter.most_common()]
 
     """
-    SQL
+    SQL 查询（通过 psql 命令行执行，支持 Text-to-SQL）
     """
 
     def sql(self, sql: str, fetch_size: int, format: str):

@@ -35,6 +35,18 @@ ATTEMPT_TIME = 2
 
 
 class ESConnectionBase(DocStoreConnection):
+    """Elasticsearch 文档存储连接基类。
+
+    提供 Elasticsearch 作为文档存储引擎的通用实现，包括：
+    - 集群健康检查和状态获取
+    - 索引的创建、删除、存在性检查
+    - 文档元数据索引管理
+    - SQL 查询支持（Text-to-SQL 场景）
+    - 搜索结果的高亮和聚合处理
+
+    具体的 search/insert/update/delete 由子类实现（如 rag.utils.es_conn.ESConnection）。
+    """
+
     def __init__(self, mapping_file_name: str="mapping.json", logger_name: str='ragflow.es_conn'):
         from common.doc_store.es_conn_pool import ES_CONN
 
@@ -53,6 +65,7 @@ class ESConnectionBase(DocStoreConnection):
         self.logger.info(f"Elasticsearch {settings.ES['hosts']} is healthy.")
 
     def _connect(self):
+        """重新连接 ES：若当前连接不可用，则从连接池刷新连接。"""
         from common.doc_store.es_conn_pool import ES_CONN
 
         if self.es.ping():
@@ -61,7 +74,7 @@ class ESConnectionBase(DocStoreConnection):
         return True
 
     """
-    Database operations
+    数据库级操作
     """
 
     def db_type(self) -> str:
@@ -122,7 +135,7 @@ class ESConnectionBase(DocStoreConnection):
             return None
 
     """
-    Table operations
+    索引 / 表操作
     """
 
     def create_idx(self, index_name: str, dataset_id: str, vector_size: int, parser_id: str = None):
@@ -241,7 +254,7 @@ class ESConnectionBase(DocStoreConnection):
         return False
 
     """
-    CRUD operations
+    CRUD 操作（由子类实现具体逻辑）
     """
 
     def get(self, doc_id: str, index_name: str, dataset_ids: list[str]) -> dict | None:
@@ -291,7 +304,7 @@ class ESConnectionBase(DocStoreConnection):
         raise NotImplementedError("Not implemented")
 
     """
-    Helper functions for search result
+    搜索结果的辅助函数
     """
 
     def get_total(self, res):
@@ -362,7 +375,7 @@ class ESConnectionBase(DocStoreConnection):
         return [(b["key"], b["doc_count"]) for b in buckets]
 
     """
-    SQL
+    SQL 查询（Text-to-SQL 场景）
     """
 
     def sql(self, sql: str, fetch_size: int, format: str):
