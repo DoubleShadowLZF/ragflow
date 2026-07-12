@@ -14,6 +14,21 @@
 #  limitations under the License.
 #
 
+"""
+
+API 工具模块
+
+提供 API 层的通用工具函数，主要包括以下功能：
+- 请求数据解析：JSON body / form data 统一获取与缓存
+- JSON 序列化：递归序列化复杂对象（ModelMetaclass 等）
+- 统一响应构建：get_json_result / get_result / get_error_data_result 等标准响应格式
+- 请求校验装饰器：validate_request（参数验证）、active_required（用户激活检查）等
+- 解析器配置：get_parser_config 合并默认与自定义分块参数
+- OpenAI 兼容格式：构建符合 OpenAI API 格式的聊天响应
+- 数据工具：deep_merge（深度合并字典）、remap_dictionary_keys（键名映射）、group_by（分组）
+- MCP 工具获取与模型压力测试
+"""
+
 import asyncio
 import functools
 import inspect
@@ -49,16 +64,31 @@ from common.constants import RetCode
 from common import settings
 from common.misc_utils import thread_pool_exec
 
+# 全局替换 requests 库的 JSON 序列化器，使用自定义编码器处理特殊类型（如 datetime）
 requests.models.complexjson.dumps = functools.partial(json.dumps, cls=CustomJSONEncoder)
 
+
+# =============================================================================
+#  请求数据解析
+# =============================================================================
+
 def _safe_jsonify(payload: dict):
+    """安全的 jsonify 包装：有 Quart 应用上下文时正常序列化，否则直接返回原始 dict。"""
     if has_app_context():
         return jsonify(payload)
     return payload
 
 
 async def _coerce_request_data() -> dict:
-    """Fetch JSON body with sane defaults; fallback to form data."""
+    """统一的请求体解析函数。
+
+    按优先级处理三种请求体格式：
+    1. 无 body → 返回空 dict
+    2. Content-Type 为 application/json → JSON 解析
+    3. 其他 Content-Type → 尝试 form data 解析
+
+    结果会缓存到 request._cached_payload，避免重复解析。
+    """
     if hasattr(request, "_cached_payload"):
         return request._cached_payload
     payload: Any = None
@@ -87,22 +117,33 @@ async def _coerce_request_data() -> dict:
     request._cached_payload = payload
     return payload
 
+
 async def get_request_json():
+    """获取已缓存的请求 JSON 数据（委托给 _coerce_request_data）。"""
     return await _coerce_request_data()
+
+# =============================================================================
+#  JSON 序列化工具
+# =============================================================================
 
 def serialize_for_json(obj):
     """
-    Recursively serialize objects to make them JSON serializable.
-    Handles ModelMetaclass and other non-serializable objects.
+    递归序列化对象，使其可被 JSON 编码。
+
+    处理策略（按优先级）：
+    1. 有 __dict__ 的对象 → 序列化其非私有属性
+    2. 类 / 元类（有 __name__） → 返回 "<module.ClassName>" 格式字符串
+    3. list/tuple → 递归序列化每个元素
+    4. dict → 递归序列化每个 value
+    5. 基本类型（str/int/float/bool/None） → 原样返回
+    6. 其他类型 → fallback 为 str() 字符串
     """
     if hasattr(obj, "__dict__"):
-        # For objects with __dict__, try to serialize their attributes
         try:
             return {key: serialize_for_json(value) for key, value in obj.__dict__.items() if not key.startswith("_")}
         except (AttributeError, TypeError):
             return str(obj)
     elif hasattr(obj, "__name__"):
-        # For classes and metaclasses, return their name
         return f"<{obj.__module__}.{obj.__name__}>" if hasattr(obj, "__module__") else f"<{obj.__name__}>"
     elif isinstance(obj, (list, tuple)):
         return [serialize_for_json(item) for item in obj]
@@ -111,11 +152,18 @@ def serialize_for_json(obj):
     elif isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
     else:
-        # Fallback: convert to string representation
         return str(obj)
 
 
+# =============================================================================
+#  错误响应与统一结果构建
+# =============================================================================
+
 def get_data_error_result(code=RetCode.DATA_ERROR, message="Sorry! Data missing!"):
+    """构建数据错误响应。
+
+    当有活跃异常时记录完整 traceback，否则仅记录错误消息。
+    """
     if sys.exc_info()[0] is not None:
         logging.exception(message)
     else:
@@ -131,7 +179,14 @@ def get_data_error_result(code=RetCode.DATA_ERROR, message="Sorry! Data missing!
 
 
 def server_error_response(e):
-    # Quart invokes this handler outside the original except block, so we must pass exc_info manually.
+    """统一的服务端异常响应处理。
+
+    特性：
+    - 自动识别 401 未授权异常并返回对应状态码
+    - 识别 Elasticsearch 索引不存在错误，给出友好提示
+    - 识别通用 not_found 错误
+    - 其余异常返回 EXCEPTION_ERROR 码 + 异常描述
+    """
     logging.error("Unhandled exception during request", exc_info=(type(e), e, e.__traceback__))
     try:
         msg = repr(e).lower()
@@ -151,7 +206,22 @@ def server_error_response(e):
     return get_json_result(code=RetCode.EXCEPTION_ERROR, message=repr(e))
 
 
+# =============================================================================
+#  请求校验装饰器
+# =============================================================================
+
 def validate_request(*args, **kwargs):
+    """请求参数校验装饰器。
+
+    用法：
+        @validate_request("name", "type")        # 必填参数检查
+        @validate_request("status", status=1)     # 必填 + 固定值校验
+        @validate_request("type", type=["a","b"]) # 必填 + 允许值集合校验
+
+    校验逻辑：
+    - args 中的参数必须在请求体中存在
+    - kwargs 中的参数必须存在且值匹配（支持固定值或允许值列表）
+    """
     def process_args(input_arguments):
         no_arguments = []
         error_arguments = []
@@ -202,6 +272,7 @@ def validate_request(*args, **kwargs):
 
 
 def not_allowed_parameters(*params):
+    """禁止参数装饰器：若请求体包含指定参数，直接返回参数错误。"""
     def decorator(func):
         async def wrapper(*args, **kwargs):
             input_arguments = await _coerce_request_data()
@@ -217,6 +288,7 @@ def not_allowed_parameters(*params):
 
 
 def active_required(func):
+    """用户激活检查装饰器：仅激活状态的用户可访问被装饰的端点。"""
     @wraps(func)
     async def wrapper(*args, **kwargs):
         from api.db.services import UserService
@@ -224,7 +296,6 @@ def active_required(func):
 
         user_id = current_user.id
         usr = UserService.filter_by_id(user_id)
-        # check is_active
         if not usr or not usr.is_active == ActiveEnum.ACTIVE.value:
             return get_json_result(code=RetCode.FORBIDDEN, message="User isn't active, please activate first.")
         if inspect.iscoroutinefunction(func):
@@ -235,6 +306,7 @@ def active_required(func):
 
 
 def add_tenant_id_to_kwargs(func):
+    """自动注入 tenant_id 到函数关键字参数的装饰器。"""
     @wraps(func)
     async def wrapper(**kwargs):
         from api.apps import current_user
@@ -245,12 +317,21 @@ def add_tenant_id_to_kwargs(func):
     return wrapper
 
 
+# =============================================================================
+#  标准 JSON 响应构建函数
+# =============================================================================
+
 def get_json_result(code: RetCode = RetCode.SUCCESS, message="success", data=None):
+    """构建标准 JSON 响应：{"code": ..., "message": ..., "data": ...}。
+
+    这是最常用的成功响应构建函数，RAGFlow 的内部 API 统一使用此格式。
+    """
     response = {"code": code, "message": message, "data": data}
     return _safe_jsonify(response)
 
 
 def build_error_result(code=RetCode.FORBIDDEN, message="success"):
+    """构建错误响应并设置 HTTP 状态码。"""
     response = {"code": code, "message": message}
     response = _safe_jsonify(response)
     if hasattr(response, "status_code"):
@@ -259,6 +340,7 @@ def build_error_result(code=RetCode.FORBIDDEN, message="success"):
 
 
 def construct_json_result(code: RetCode = RetCode.SUCCESS, message="success", data=None):
+    """构建 JSON 响应，data 为 None 时省略该字段。"""
     if data is None:
         return _safe_jsonify({"code": code, "message": message})
     return _safe_jsonify({"code": code, "message": message, "data": data})
@@ -266,13 +348,12 @@ def construct_json_result(code: RetCode = RetCode.SUCCESS, message="success", da
 
 def get_result(code=RetCode.SUCCESS, message="", data=None, total=None):
     """
-    Standard API response format:
-    {
-        "code": 0,
-        "data": [...],        # List or object, backward compatible
-        "total": 47,          # Optional field for pagination
-        "message": "..."      # Error or status message
-    }
+    标准 API 分页响应格式。
+
+    成功时返回 {"code": 0, "data": [...], "total_datasets": 47}
+    失败时返回 {"code": xxx, "message": "..."}
+
+    注意：total 字段在 JSON 中映射为 total_datasets，用于前端兼容。
     """
     response = {"code": code}
 
@@ -291,6 +372,7 @@ def get_error_data_result(
     message="Sorry! Data missing!",
     code=RetCode.DATA_ERROR,
 ):
+    """构建数据错误响应，过滤掉值为 None 的非 code 字段。"""
     result_dict = {"code": code, "message": message}
     response = {}
     for key, value in result_dict.items():
@@ -302,28 +384,50 @@ def get_error_data_result(
 
 
 def get_error_argument_result(message="Invalid arguments"):
+    """快捷构建参数错误响应。"""
     return get_result(code=RetCode.ARGUMENT_ERROR, message=message)
 
 
 def get_error_permission_result(message="Permission error"):
+    """快捷构建权限错误响应。"""
     return get_result(code=RetCode.PERMISSION_ERROR, message=message)
 
 
 def get_error_operating_result(message="Operating error"):
+    """快捷构建操作错误响应。"""
     return get_result(code=RetCode.OPERATING_ERROR, message=message)
 
 
+# =============================================================================
+#  Token 生成
+# =============================================================================
+
 def generate_confirmation_token():
+    """生成 API 访问令牌，格式为 "ragflow-" + 32 字节 URL 安全随机字符串。"""
     import secrets
 
     return "ragflow-" + secrets.token_urlsafe(32)
 
 
+# =============================================================================
+#  文档解析器配置
+# =============================================================================
+
 def get_parser_config(chunk_method, parser_config):
+    """获取文档分块解析器的完整配置。
+
+    将用户自定义配置与各分块方法的默认值深度合并。默认值包含：
+    - 基础参数：chunk_token_num、delimiter、layout_recognize 等
+    - RAPTOR 递归摘要参数
+    - GraphRAG 知识图谱构建参数
+    - 父子分块（parent_child）参数
+
+    合并策略：用户配置的字段覆盖默认值，未配置的字段保留默认值。
+    """
     if not chunk_method:
         chunk_method = "naive"
 
-    # Define default configurations for each chunking method
+    # 各分块方法的默认配置
     base_defaults = {
         "table_context_size": 0,
         "image_context_size": 0,
@@ -394,21 +498,21 @@ def get_parser_config(chunk_method, parser_config):
 
     default_config = key_mapping[chunk_method]
 
-    # If no parser_config provided, return default merged with base defaults
+    # 无用户配置 → 合并基础默认值和方法默认值
     if not parser_config:
         if default_config is None:
             merged_config = deep_merge(base_defaults, {})
         else:
             merged_config = deep_merge(base_defaults, default_config)
     elif default_config is None:
-        # If parser_config is provided but no defaults for this method
+        # 有用户配置但该方法无默认值 → 仅合并基础默认值和用户配置
         merged_config = deep_merge(base_defaults, parser_config)
     else:
-        # Ensure raptor and graph_rag fields have default values if not provided
+        # 有用户配置且有方法默认值 → 三层合并（基础 → 方法默认 → 用户自定义）
         merged_config = deep_merge(base_defaults, default_config)
         merged_config = deep_merge(merged_config, parser_config)
 
-    # Flatten parent_child config into children_delimiter for the execution layer
+    # 将 parent_child 嵌套配置展平为 children_delimiter，供执行层直接使用
     pc = merged_config.get("parent_child", {})
     if pc.get("use_parent_child"):
         merged_config["children_delimiter"] = pc.get("children_delimiter", "\n")
@@ -418,7 +522,17 @@ def get_parser_config(chunk_method, parser_config):
     return merged_config
 
 
+# =============================================================================
+#  OpenAI 兼容格式响应构建
+# =============================================================================
+
 def get_data_openai(id=None, created=None, model=None, prompt_tokens=0, completion_tokens=0, content=None, finish_reason=None, object="chat.completion", param=None, stream=False):
+    """构建符合 OpenAI API 格式的聊天响应。
+
+    支持两种模式：
+    - stream=True: 返回 chat.completion.chunk 格式的流式响应块
+    - stream=False: 返回标准 chat.completion 格式，含 usage token 统计
+    """
     total_tokens = prompt_tokens + completion_tokens
 
     if stream:
@@ -462,18 +576,20 @@ def get_data_openai(id=None, created=None, model=None, prompt_tokens=0, completi
     }
 
 
+# =============================================================================
+#  数据校验与工具函数
+# =============================================================================
+
 def check_duplicate_ids(ids, id_type="item"):
     """
-    Check for duplicate IDs in a list and return unique IDs and error messages.
+    检查 ID 列表中的重复项，返回去重后的 ID 列表和重复错误消息。
 
     Args:
-        ids (list): List of IDs to check for duplicates
-        id_type (str): Type of ID for error messages (e.g., 'document', 'dataset', 'chunk')
+        ids: ID 列表
+        id_type: ID 类型名称，用于错误消息（如 'document', 'dataset', 'chunk'）
 
     Returns:
         tuple: (unique_ids, error_messages)
-            - unique_ids (list): List of unique IDs
-            - error_messages (list): List of error messages for duplicate IDs
     """
     id_count = {}
     duplicate_messages = []
@@ -492,41 +608,23 @@ def check_duplicate_ids(ids, id_type="item"):
 
 
 def verify_embedding_availability(embd_id: str, tenant_id: str) -> tuple[bool, str | None]:
-    from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
-
     """
-    Verifies availability of an embedding model for a specific tenant.
+    验证指定租户是否可用某个嵌入模型。
 
-    Performs comprehensive verification through:
-    1. Identifier Parsing: Decomposes embd_id into name and factory components
-    2. System Verification: Checks model registration in LLMService
-    3. Tenant Authorization: Validates tenant-specific model assignments
-    4. Built-in Model Check: Confirms inclusion in predefined system models
+    验证流程：
+    1. 解析 embd_id 中的模型名和厂商信息
+    2. 检查模型在系统中的注册状态
+    3. 验证租户级别的模型授权
+    4. 确认模型在内置模型列表中
 
     Args:
-        embd_id (str): Unique identifier for the embedding model in format "model_name@factory"
-        tenant_id (str): Tenant identifier for access control
+        embd_id: 嵌入模型标识符，格式 "model_name@factory"（如 "text-embedding@openai"）
+        tenant_id: 租户 ID
 
     Returns:
-        tuple[bool, Response | None]:
-        - First element (bool):
-            - True: Model is available and authorized
-            - False: Validation failed
-        - Second element contains:
-            - None on success
-            - Error detail dict on failure
-
-    Raises:
-        ValueError: When model identifier format is invalid
-        OperationalError: When database connection fails (auto-handled)
-
-    Examples:
-        >>> verify_embedding_availability("text-embedding@openai", "tenant_123")
-        (True, None)
-
-        >>> verify_embedding_availability("invalid_model", "tenant_123")
-        (False, {'code': 101, 'message': "Unsupported model: <invalid_model>"})
+        tuple[bool, str | None]: (是否可用, 错误信息或None)
     """
+    from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
     try:
         get_model_config_from_provider_instance(tenant_id, LLMType.EMBEDDING, embd_id)
     except LookupError as e:
@@ -541,37 +639,25 @@ def verify_embedding_availability(embd_id: str, tenant_id: str) -> tuple[bool, s
     return True, None
 
 
+# =============================================================================
+#  字典操作工具
+# =============================================================================
+
 def deep_merge(default: dict, custom: dict) -> dict:
     """
-    Recursively merges two dictionaries with priority given to `custom` values.
+    深度合并两个字典，custom 中的值优先。
 
-    Creates a deep copy of the `default` dictionary and iteratively merges nested
-    dictionaries using a stack-based approach. Non-dict values in `custom` will
-    completely override corresponding entries in `default`.
+    使用栈式迭代（非递归）实现，避免深层嵌套导致的递归深度问题。
 
-    Args:
-        default (dict): Base dictionary containing default values.
-        custom (dict): Dictionary containing overriding values.
-
-    Returns:
-        dict: New merged dictionary combining values from both inputs.
+    合并规则：
+    - 两个 dict 的同名 key 且 value 均为 dict → 递归合并
+    - 其他情况（非 dict value 或类型不匹配） → custom 完全覆盖 default
 
     Example:
-        >>> from copy import deepcopy
         >>> default = {"a": 1, "nested": {"x": 10, "y": 20}}
         >>> custom = {"b": 2, "nested": {"y": 99, "z": 30}}
         >>> deep_merge(default, custom)
         {'a': 1, 'b': 2, 'nested': {'x': 10, 'y': 99, 'z': 30}}
-
-        >>> deep_merge({"config": {"mode": "auto"}}, {"config": "manual"})
-        {'config': 'manual'}
-
-    Notes:
-        1. Merge priority is always given to `custom` values at all nesting levels
-        2. Non-dict values (e.g. list, str) in `custom` will replace entire values
-           in `default`, even if the original value was a dictionary
-        3. Time complexity: O(N) where N is total key-value pairs in `custom`
-        4. Recommended for configuration merging and nested data updates
     """
     merged = deepcopy(default)
     stack = [(merged, custom)]
@@ -590,21 +676,15 @@ def deep_merge(default: dict, custom: dict) -> dict:
 
 def remap_dictionary_keys(source_data: dict, key_aliases: dict = None) -> dict:
     """
-    Transform dictionary keys using a configurable mapping schema.
+    将字典的键名按映射表转换（仅改键名，值不变）。
 
-    Args:
-        source_data: Original dictionary to process
-        key_aliases: Custom key transformation rules (Optional)
-            When provided, overrides default key mapping
-            Format: {<original_key>: <new_key>, ...}
+    默认映射（旧字段名 → 新字段名）：
+    - chunk_num → chunk_count
+    - doc_num → document_count
+    - parser_id → chunk_method
+    - embd_id → embedding_model
 
-    Returns:
-        dict: New dictionary with transformed keys preserving original values
-
-    Example:
-        >>> input_data = {"old_key": "value", "another_field": 42}
-        >>> remap_dictionary_keys(input_data, {"old_key": "new_key"})
-        {'new_key': 'value', 'another_field': 42}
+    可通过 key_aliases 参数传入自定义映射覆盖默认值。
     """
     DEFAULT_KEY_MAP = {
         "chunk_num": "chunk_count",
@@ -624,6 +704,7 @@ def remap_dictionary_keys(source_data: dict, key_aliases: dict = None) -> dict:
 
 
 def group_by(list_of_dict, key):
+    """按指定键对字典列表进行分组，返回 {key_value: [matched_items, ...]} 的结构。"""
     res = {}
     for item in list_of_dict:
         if item[key] in res.keys():
@@ -633,7 +714,19 @@ def group_by(list_of_dict, key):
     return res
 
 
+# =============================================================================
+#  MCP 工具获取
+# =============================================================================
+
 def get_mcp_tools(mcp_servers: list, timeout: float | int = 10) -> tuple[dict, str]:
+    """从 MCP 服务器列表获取所有可用工具。
+
+    遍历每个 MCP 服务器，获取其工具列表并合并缓存中的 enabled 状态。
+    完成后关闭所有 MCP 会话释放资源。
+
+    Returns:
+        tuple[dict, str]: (按服务器分组的工具列表, 错误信息（空串表示成功）)
+    """
     results = {}
     tool_call_sessions = []
     try:
@@ -655,17 +748,32 @@ def get_mcp_tools(mcp_servers: list, timeout: float | int = 10) -> tuple[dict, s
                 tool_dict = tool.model_dump()
                 cached_tool = cached_tools.get(tool_dict["name"], {})
 
+                # 合并缓存中的 enabled 状态，默认启用
                 tool_dict["enabled"] = cached_tool.get("enabled", True)
                 results[server_key].append(tool_dict)
 
-        # PERF: blocking call to close sessions — consider moving to background thread or task queue
         close_multiple_mcp_toolcall_sessions(tool_call_sessions)
         return results, ""
     except Exception as e:
         return {}, str(e)
 
 
+# =============================================================================
+#  模型压力测试（GraphRAG 任务前置检查）
+# =============================================================================
+
 async def is_strong_enough(chat_model, embedding_model):
+    """对聊天模型和嵌入模型进行并发压力测试。
+
+    并发执行 STRONG_TEST_COUNT 次模型调用，验证模型在并发场景下的可用性。
+    主要用于 GraphRAG 任务的前置检查，避免在模型不可用时启动大规模处理。
+
+    每个并发任务包含：
+    - 嵌入模型：编码测试文本（10 秒超时）
+    - 聊天模型：发送测试对话（30 秒超时）
+
+    若任一并发任务失败，取消所有剩余任务并向上抛出异常。
+    """
     count = settings.STRONG_TEST_COUNT
     if not chat_model or not embedding_model:
         return
@@ -689,7 +797,7 @@ async def is_strong_enough(chat_model, embedding_model):
             if "**ERROR**" in res:
                 raise Exception(res)
 
-    # Pressure test for GraphRAG task
+    # 创建 STRONG_TEST_COUNT 个并发压力测试任务
     tasks = [
         asyncio.create_task(_is_strong_enough())
         for _ in range(count)
@@ -704,7 +812,15 @@ async def is_strong_enough(chat_model, embedding_model):
         raise
 
 
+# =============================================================================
+#  LLM 厂商过滤
+# =============================================================================
+
 def get_allowed_llm_factories() -> list:
+    """获取当前允许使用的 LLM 厂商列表。
+
+    按 rank 降序排列，若配置了 ALLOWED_LLM_FACTORIES 白名单则过滤。
+    """
     factories = list(LLMFactoriesService.get_all(reverse=True, order_by="rank"))
     if settings.ALLOWED_LLM_FACTORIES is None:
         return factories
