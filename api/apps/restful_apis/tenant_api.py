@@ -34,13 +34,19 @@ from common.constants import RetCode, StatusEnum
 from common.misc_utils import get_uuid
 from common.time_utils import delta_seconds
 
-# Keeps strong references to fire-and-forget tasks so they are not GC'd before completion.
+# 保存对"即发即忘"（fire-and-forget）异步任务的强引用，防止任务在完成前被垃圾回收。
 _background_tasks: Set[asyncio.Task] = set()
 
 
 @manager.route("/tenants/<tenant_id>/users", methods=["GET"])  # noqa: F821
 @login_required
 def user_list(tenant_id):
+    """获取指定租户下的所有用户列表。
+
+    仅允许租户所有者（tenant_id 等于当前用户 ID）查看。
+    返回用户列表时，会为每个用户附加上次更新时间距现在的秒数（delta_seconds）。
+    """
+    # 权限校验：只有租户所有者才能查看成员列表
     if current_user.id != tenant_id:
         return get_json_result(
             data=False,
@@ -61,6 +67,15 @@ def user_list(tenant_id):
 @login_required
 @validate_request("email")
 async def create(tenant_id):
+    """邀请用户加入租户（团队）。
+
+    流程：
+    1. 校验当前用户是否为租户所有者。
+    2. 根据邮箱查找被邀请用户，检查是否已在团队中。
+    3. 在 user_tenant 表中创建 INVITE 状态的记录。
+    4. 异步发送邀请邮件（fire-and-forget 模式，不阻塞响应）。
+    """
+    # 权限校验：只有租户所有者才能邀请
     if current_user.id != tenant_id:
         return get_json_result(
             data=False,
@@ -75,6 +90,7 @@ async def create(tenant_id):
         return get_data_error_result(message="User not found.")
 
     user_id_to_invite = invite_users[0].id
+    # 检查被邀请用户与租户的现有关系
     user_tenants = UserTenantService.query(user_id=user_id_to_invite, tenant_id=tenant_id)
     if user_tenants:
         user_tenant_role = user_tenants[0].role
@@ -86,6 +102,7 @@ async def create(tenant_id):
             message=f"{invite_user_email} is in the team, but the role: {user_tenant_role} is invalid."
         )
 
+    # 创建 INVITE 状态的租户-用户关联记录
     UserTenantService.save(
         id=get_uuid(),
         user_id=user_id_to_invite,
@@ -95,6 +112,7 @@ async def create(tenant_id):
         status=StatusEnum.VALID.value,
     )
 
+    # 异步发送邀请邮件（fire-and-forget 模式）
     try:
         user_name = ""
         _, user = UserService.get_by_id(current_user.id)
@@ -102,6 +120,7 @@ async def create(tenant_id):
             user_name = user.nickname
 
         def _on_invite_email_done(done_task: asyncio.Task) -> None:
+            """邀请邮件任务的完成回调：清理后台任务集合并处理异常。"""
             _background_tasks.discard(done_task)
             try:
                 done_task.result()
@@ -129,6 +148,7 @@ async def create(tenant_id):
             code=RetCode.SERVER_ERROR,
         )
 
+    # 返回被邀请用户的基本信息
     user = invite_users[0].to_dict()
     user = {k: v for k, v in user.items() if k in ["id", "avatar", "email", "nickname"]}
     return get_json_result(data=user)
@@ -138,8 +158,15 @@ async def create(tenant_id):
 @login_required
 @validate_request("user_id")
 async def rm(tenant_id):
+    """从租户中移除用户。
+
+    允许两种角色操作：
+    - 租户所有者（current_user.id == tenant_id）可以移除任何成员
+    - 用户本人（current_user.id == user_id）可以主动退出团队
+    """
     req = await get_request_json()
     user_id = req["user_id"]
+    # 权限校验：租户所有者或用户本人才可移除
     if current_user.id != tenant_id and current_user.id != user_id:
         return get_json_result(
             data=False,
@@ -157,6 +184,10 @@ async def rm(tenant_id):
 @manager.route("/tenants", methods=["GET"])  # noqa: F821
 @login_required
 def tenant_list():
+    """获取当前用户所属的所有租户列表。
+
+    返回每个租户的基本信息及上次更新时间距现在的秒数（delta_seconds）。
+    """
     try:
         users = UserTenantService.get_tenants_by_user_id(current_user.id)
         for user in users:
@@ -169,7 +200,13 @@ def tenant_list():
 @manager.route("/tenants/<tenant_id>", methods=["PATCH"])  # noqa: F821
 @login_required
 def agree(tenant_id):
+    """当前用户同意加入指定租户。
+
+    将用户在租户中的角色从 INVITE（受邀）变更为 NORMAL（正式成员），
+    即完成邀请确认流程。
+    """
     try:
+        # 将角色从 INVITE 更新为 NORMAL，表示接受邀请
         UserTenantService.filter_update(
             [UserTenant.tenant_id == tenant_id, UserTenant.user_id == current_user.id],
             {"role": UserTenantRole.NORMAL},
