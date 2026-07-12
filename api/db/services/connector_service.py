@@ -13,6 +13,17 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+外部数据源连接器服务层。
+
+本模块提供三个核心服务类，封装连接器相关的业务逻辑和数据库操作：
+
+- **ConnectorService** — 连接器的 CRUD、调度、权限检查、过期文档清理。
+- **SyncLogsService** — 同步任务日志的创建、查询、状态管理，以及将外部文档写入知识库。
+- **Connector2KbService** — 连接器与知识库的多对多关联管理。
+
+所有服务类均继承自 ``CommonService``，使用 Peewee ORM 进行数据库操作。
+"""
 import logging
 from datetime import datetime
 import os
@@ -32,14 +43,21 @@ from common.constants import ConnectorTaskType, TaskStatus
 from common.settings import TIMEZONE
 from common.time_utils import current_timestamp, timestamp_to_date
 
+# 模块级日志记录器
 LOGGER = logging.getLogger(__name__)
 
 
 class ConnectorService(CommonService):
+    """连接器服务 — 管理外部数据源连接器的生命周期。
+
+    负责连接器的创建、更新、删除、调度、权限校验以及过期文档清理。
+    """
+
     model = Connector
 
     @classmethod
     def cancel_tasks(cls, connector_id):
+        """取消指定连接器的所有待执行和运行中的同步任务。"""
         e, conn = cls.get_by_id(connector_id)
         if not e:
             return
@@ -68,7 +86,7 @@ class ConnectorService(CommonService):
     @classmethod
     @DB.connection_context()
     def accessible(cls, connector_id: str, user_id: str) -> bool:
-        """Return whether the user can access the connector's tenant."""
+        """判断用户是否有权限访问该连接器（所属租户或已加入的租户）。"""
         e, connector = cls.get_by_id(connector_id)
         if not e:
             LOGGER.warning("connector access denied: connector not found connector_id=%s user_id=%s", connector_id, user_id)
@@ -92,6 +110,7 @@ class ConnectorService(CommonService):
 
     @classmethod
     def schedule_tasks(cls, connector_id):
+        """为连接器关联的所有知识库调度同步（SYNC）和可选的剪枝（PRUNE）任务。"""
         e, conn = cls.get_by_id(connector_id)
         if not e:
             return
@@ -127,6 +146,7 @@ class ConnectorService(CommonService):
 
     @classmethod
     def list(cls, tenant_id):
+        """列出指定租户的所有连接器（仅返回 id、name、source、status 字段）。"""
         fields = [
             cls.model.id,
             cls.model.name,
@@ -139,6 +159,7 @@ class ConnectorService(CommonService):
 
     @classmethod
     def rebuild(cls, kb_id:str, connector_id: str, tenant_id:str):
+        """删除知识库中该连接器的所有文档，重新调度同步任务（全量重建）。"""
         from api.db.services.file_service import FileService
         e, conn = cls.get_by_id(connector_id)
         if not e:
@@ -161,6 +182,11 @@ class ConnectorService(CommonService):
         file_list,
         delete_batch_size: int = 100,
     ):
+        """删除知识库中不在当前文件列表里的过期文档（远端已删除的文件）。
+
+        通过比较远端文件列表与知识库中已有的文档，找出过期的文档并批量删除。
+        每次最多删除 ``delete_batch_size`` 个文档。
+        """
         from api.db.services.file_service import FileService
 
         if not Connector2KbService.query(connector_id=connector_id, kb_id=kb_id):
@@ -211,11 +237,22 @@ class ConnectorService(CommonService):
 
 
 class SyncLogsService(CommonService):
+    """同步日志服务 — 管理连接器同步任务的调度、执行和状态追踪。
+
+    负责同步任务（SYNC）和剪枝任务（PRUNE）的创建、查询、状态流转，
+    以及将外部文档数据导入知识库。
+    """
+
     model = SyncLogs
 
-    
+
     @classmethod
     def list_sync_tasks(cls, connector_id=None, page_number=None, items_per_page=15) -> Tuple[List[dict], int]:
+        """分页查询同步任务日志。
+
+        若指定 connector_id 则只查该连接器的日志；
+        否则查询所有处于 SCHEDULE 状态且已到期的轮询型连接器任务。
+        """
         fields = [
             cls.model.id,
             cls.model.connector_id,
@@ -265,6 +302,7 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def list_due_sync_tasks(cls) -> List[dict]:
+        """列出所有到期的 SYNC（同步）任务。"""
         return cls._list_due_tasks_for_freq(
             ConnectorTaskType.SYNC,
             "refresh_freq",
@@ -272,6 +310,7 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def list_due_prune_tasks(cls) -> List[dict]:
+        """列出所有到期的 PRUNE（剪枝）任务，仅返回启用了 sync_deleted_files 的连接器。"""
         tasks = cls._list_due_tasks_for_freq(
             ConnectorTaskType.PRUNE,
             "prune_freq",
@@ -286,6 +325,11 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def _list_due_tasks_for_freq(cls, task_type: str, freq_field: str) -> List[dict]:
+        """内部方法：根据任务类型和频率字段查询已到期的轮询任务。
+
+        通过数据库时间计算（NOW - freq_field）判断是否到期，
+        支持 MySQL 和 PostgreSQL 两种数据库。
+        """
         fields = [
             cls.model.id,
             cls.model.connector_id,
@@ -339,11 +383,13 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def start(cls, id, connector_id):
+        """将任务和连接器状态标记为 RUNNING（运行中）。"""
         cls.update_by_id(id, {"status": TaskStatus.RUNNING, "time_started": datetime.now().strftime('%Y-%m-%d %H:%M:%S') })
         ConnectorService.update_by_id(connector_id, {"status": TaskStatus.RUNNING})
 
     @classmethod
     def done(cls, id, connector_id):
+        """将任务和连接器状态标记为 DONE（已完成）。"""
         cls.update_by_id(id, {"status": TaskStatus.DONE})
         ConnectorService.update_by_id(connector_id, {"status": TaskStatus.DONE})
 
@@ -357,6 +403,11 @@ class SyncLogsService(CommonService):
         total_docs_indexed=0,
         task_type=ConnectorTaskType.SYNC,
     ):
+        """调度一个新的同步或剪枝任务。
+
+        若同一连接器+知识库已有 SCHEDULE 状态的任务，则跳过创建。
+        日志超过 100 条时自动清理旧记录。
+        """
         try:
             if cls.model.select().where(cls.model.kb_id == kb_id, cls.model.connector_id == connector_id).count() > 100:
                 rm_ids = [m.id for m in cls.model.select(cls.model.id).where(cls.model.kb_id == kb_id, cls.model.connector_id == connector_id).order_by(cls.model.update_time.asc()).limit(70)]
@@ -404,6 +455,7 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def increase_docs(cls, id, max_update, doc_num, err_msg="", error_count=0):
+        """递增已索引文档计数，并保持 poll_range 单调递增。"""
         # Keep sync monotonic.
         cls.model.update(new_docs_indexed=cls.model.new_docs_indexed + doc_num,
                          total_docs_indexed=cls.model.total_docs_indexed + doc_num,
@@ -418,6 +470,7 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def increase_removed_docs(cls, id, removed_count, err_msg="", error_count=0):
+        """递增已从索引中移除的文档计数。"""
         cls.model.update(
             docs_removed_from_index=cls.model.docs_removed_from_index + removed_count,
             error_msg=cls.model.error_msg + err_msg,
@@ -428,6 +481,11 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def duplicate_and_parse(cls, kb, docs, tenant_id, src, auto_parse=True):
+        """将外部文档上传到知识库并可选地触发解析。
+
+        为每个文档创建 ``FileObj``，调用 ``FileService.upload_document`` 上传，
+        同时将文档的 metadata 写入 ``DocMetadataService``。
+        """
         from api.db.services.file_service import FileService
         if not docs:
             return None
@@ -470,6 +528,7 @@ class SyncLogsService(CommonService):
 
     @classmethod
     def get_latest_task(cls, connector_id, kb_id, task_type=None):
+        """获取指定连接器和知识库的最新同步任务（可按任务类型过滤）。"""
         query = cls.model.select().where(
             cls.model.connector_id==connector_id,
             cls.model.kb_id == kb_id
@@ -480,10 +539,21 @@ class SyncLogsService(CommonService):
 
 
 class Connector2KbService(CommonService):
+    """连接器-知识库关联服务 — 管理连接器与知识库的多对多关系。
+
+    负责将连接器绑定到知识库、解绑，以及管理自动解析（auto_parse）设置。
+    """
+
     model = Connector2Kb
 
     @classmethod
     def link_connectors(cls, kb_id:str, connectors: list[dict], tenant_id:str):
+        """将一组连接器绑定到指定知识库。
+
+        - 已存在的绑定：更新 auto_parse 设置。
+        - 新的绑定：创建关联并调度 SYNC 任务（若配置了 sync_deleted_files 则同时调度 PRUNE）。
+        - 旧的绑定（不在新列表中）：取消正在执行的任务（不删除文档）。
+        """
         arr = cls.query(kb_id=kb_id)
         old_conn_ids = [a.connector_id for a in arr]
         connector_ids = []
@@ -523,6 +593,7 @@ class Connector2KbService(CommonService):
 
     @classmethod
     def list_connectors(cls, kb_id):
+        """列出绑定到指定知识库的所有连接器。"""
         fields = [
             Connector.id,
             Connector.source,

@@ -13,6 +13,24 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+外部数据源连接器 RESTful API 端点。
+
+本模块提供连接器（Google Drive、Gmail、Box、REST API 等）的 CRUD 操作，
+以及 OAuth 2.0 Web 流程端点，允许用户通过基于浏览器的授权页面
+授权 RAGFlow 访问其第三方数据。
+
+路由前缀: ``/api/v1/connectors``（由 ``api/apps/restful_apis/__init__.py`` 注册）。
+
+OAuth 2.0 Web 流程（Google / Box）
+---------------------------------
+1. POST ``/google/oauth/web/start``（或 ``/box/oauth/web/start``）——
+   返回授权 URL，并将中间状态缓存到 Redis。
+2. GET ``/google-drive/oauth/web/callback``（或 ``/box/oauth/web/callback``）——
+   OAuth 提供方重定向到此端点；处理器用授权码换取 token 并将结果存入 Redis。
+3. POST ``/google/oauth/web/result``（或 ``/box/oauth/web/result``）——
+   前端轮询此端点以获取已存储的 token。
+"""
 import asyncio
 import json
 import logging
@@ -37,11 +55,12 @@ from api.apps import login_required, current_user
 from box_sdk_gen import BoxOAuth, OAuthConfig, GetAuthorizeUrlOptions
 
 
+# 模块级日志记录器
 LOGGER = logging.getLogger(__name__)
 
 
 def _connector_auth_error(connector_id: str, user_id: str):
-    """Return the connector authorization failure response and log the denial."""
+    """返回连接器授权失败响应并记录拒绝日志。"""
     LOGGER.warning("connector access denied: connector_id=%s user_id=%s", connector_id, user_id)
     return get_json_result(data=False, message="No authorization.", code=RetCode.AUTHENTICATION_ERROR)
 
@@ -49,7 +68,7 @@ def _connector_auth_error(connector_id: str, user_id: str):
 @manager.route("/connectors/<connector_id>", methods=["PATCH"])  # noqa: F821
 @login_required
 async def update_connector(connector_id):
-    """Update an accessible connector's polling configuration."""
+    """更新可访问连接器的轮询配置（刷新频率、剪枝频率、超时等）。"""
     if not ConnectorService.accessible(connector_id, current_user.id):
         return _connector_auth_error(connector_id, current_user.id)
 
@@ -89,7 +108,7 @@ async def update_connector(connector_id):
 @manager.route("/connectors", methods=["POST"])  # noqa: F821
 @login_required
 async def create_connector():
-    """Create a connector owned by the current tenant."""
+    """创建属于当前租户的连接器。"""
     req = await get_request_json()
     if req:
         req["id"] = get_uuid()
@@ -116,14 +135,14 @@ async def create_connector():
 @manager.route("/connectors", methods=["GET"])  # noqa: F821
 @login_required
 def list_connector():
-    """List connectors owned by the current tenant."""
+    """列出当前租户拥有的所有连接器。"""
     return get_json_result(data=ConnectorService.list(current_user.id))
 
 
 @manager.route("/connectors/<connector_id>", methods=["GET"])  # noqa: F821
 @login_required
 def get_connector(connector_id):
-    """Return connector details when the current user can access it."""
+    """当前用户可访问时返回连接器详情。"""
     if not ConnectorService.accessible(connector_id, current_user.id):
         return _connector_auth_error(connector_id, current_user.id)
 
@@ -136,7 +155,7 @@ def get_connector(connector_id):
 @manager.route("/connectors/<connector_id>/logs", methods=["GET"])  # noqa: F821
 @login_required
 def list_logs(connector_id):
-    """List sync logs for a connector the current user can access."""
+    """列出当前用户可访问连接器的同步日志。"""
     if not ConnectorService.accessible(connector_id, current_user.id):
         return _connector_auth_error(connector_id, current_user.id)
 
@@ -152,7 +171,7 @@ def list_logs(connector_id):
 @manager.route("/connectors/<connector_id>/rebuild", methods=["POST"])  # noqa: F821
 @login_required
 async def rebuild(connector_id):
-    """Schedule a rebuild for an accessible connector and knowledge base."""
+    """为可访问的连接器和知识库触发重建任务。"""
     if not ConnectorService.accessible(connector_id, current_user.id):
         return _connector_auth_error(connector_id, current_user.id)
 
@@ -169,7 +188,7 @@ async def rebuild(connector_id):
 @manager.route("/connectors/<connector_id>", methods=["DELETE"])  # noqa: F821
 @login_required
 def rm_connector(connector_id):
-    """Delete an accessible connector after canceling its sync tasks."""
+    """先取消同步任务，再删除可访问的连接器。"""
     if not ConnectorService.accessible(connector_id, current_user.id):
         return _connector_auth_error(connector_id, current_user.id)
 
@@ -181,10 +200,10 @@ def rm_connector(connector_id):
 @manager.route("/connectors/<connector_id>/test", methods=["POST"])  # noqa: F821
 @login_required
 async def test_connector(connector_id):
-    """Validate connector configuration without persisting changes or triggering sync.
+    """验证连接器配置，不持久化更改也不触发同步。
 
-    For the REST API connector, this uses `RestAPIConnector.validate_config`
-    against the existing saved configuration.
+    对于 REST API 连接器，使用 ``RestAPIConnector.validate_config``
+    基于已保存的配置进行验证。
     """
     if not ConnectorService.accessible(connector_id, current_user.id):
         return _connector_auth_error(connector_id, current_user.id)
@@ -229,30 +248,33 @@ async def test_connector(connector_id):
     return get_json_result(data=True)
 
 
+# OAuth Web 流程状态和结果缓存的 Redis TTL（秒）。
+# 超过此时间窗口后，用户必须重新发起授权流程。
 WEB_FLOW_TTL_SECS = 15 * 60
 
 
 def _web_state_cache_key(flow_id: str, source_type: str | None = None) -> str:
-    """Return Redis key for web OAuth state.
+    """返回 Web OAuth 状态的 Redis 键名。
 
-    The default prefix keeps backward compatibility for Google Drive.
-    When source_type == "gmail", a different prefix is used so that
-    Drive/Gmail flows don't clash in Redis.
+    默认前缀保持对 Google Drive 的向后兼容性。
+    当 source_type == "gmail" 时，使用不同的前缀，
+    以避免 Drive/Gmail 流程在 Redis 中冲突。
     """
     prefix = f"{source_type}_web_flow_state"
     return f"{prefix}:{flow_id}"
 
 
 def _web_result_cache_key(flow_id: str, source_type: str | None = None) -> str:
-    """Return Redis key for web OAuth result.
+    """返回 Web OAuth 结果的 Redis 键名。
 
-    Mirrors _web_state_cache_key logic for result storage.
+    与 _web_state_cache_key 逻辑一致，用于结果存储。
     """
     prefix = f"{source_type}_web_flow_result"
     return f"{prefix}:{flow_id}"
 
 
 def _load_credentials(payload: str | dict[str, Any]) -> dict[str, Any]:
+    """将 JSON 字符串或字典解析为凭据字典。"""
     if isinstance(payload, dict):
         return payload
     try:
@@ -262,6 +284,7 @@ def _load_credentials(payload: str | dict[str, Any]) -> dict[str, Any]:
 
 
 def _get_web_client_config(credentials: dict[str, Any]) -> dict[str, Any]:
+    """从凭据中提取 Google OAuth Web 客户端配置，若不存在则抛出 ValueError。"""
     web_section = credentials.get("web")
     if not isinstance(web_section, dict):
         raise ValueError("Google OAuth JSON must include a 'web' client configuration to use browser-based authorization.")
@@ -275,6 +298,7 @@ def _exchange_google_web_oauth_code(
     code: str,
     code_verifier: str | None,
 ) -> Flow:
+    """用 Google 授权码换取 OAuth token，返回已授权的 Flow 对象。"""
     flow = Flow.from_client_config(client_config, scopes=scopes)
     flow.redirect_uri = redirect_uri
     fetch_token_kwargs: dict[str, Any] = {"code": code}
@@ -285,6 +309,7 @@ def _exchange_google_web_oauth_code(
 
 
 async def _render_web_oauth_popup(flow_id: str, success: bool, message: str, source="drive"):
+    """渲染 OAuth Web 流程完成后的弹出页面（成功或失败）。"""
     status = "success" if success else "error"
     auto_close = "window.close();" if success else ""
     escaped_message = escape(message)
@@ -316,6 +341,11 @@ async def _render_web_oauth_popup(flow_id: str, success: bool, message: str, sou
 @login_required
 @validate_request("credentials")
 async def start_google_web_oauth():
+    """启动 Google OAuth Web 授权流程，返回授权 URL。
+
+    支持 google-drive 和 gmail 两种类型。
+    将 OAuth 中间状态缓存到 Redis，TTL 由 ``WEB_FLOW_TTL_SECS`` 控制。
+    """
     source = request.args.get("type", "google-drive")
     if source not in ("google-drive", "gmail"):
         return get_json_result(code=RetCode.ARGUMENT_ERROR, message="Invalid Google OAuth type.")
@@ -395,6 +425,7 @@ async def start_google_web_oauth():
 
 @manager.route("/connectors/gmail/oauth/web/callback", methods=["GET"])  # noqa: F821
 async def google_gmail_web_oauth_callback():
+    """Google Gmail OAuth 回调端点，用授权码换取 token 并存入 Redis。"""
     state_id = request.args.get("state")
     error = request.args.get("error")
     source = "gmail"
@@ -450,6 +481,7 @@ async def google_gmail_web_oauth_callback():
 
 @manager.route("/connectors/google-drive/oauth/web/callback", methods=["GET"])  # noqa: F821
 async def google_drive_web_oauth_callback():
+    """Google Drive OAuth 回调端点，用授权码换取 token 并存入 Redis。"""
     state_id = request.args.get("state")
     error = request.args.get("error")
     source = "google-drive"
@@ -506,6 +538,10 @@ async def google_drive_web_oauth_callback():
 @login_required
 @validate_request("flow_id")
 async def poll_google_web_result():
+    """前端轮询此端点，获取 Google OAuth 授权完成后的凭据。
+
+    从 Redis 读取回调阶段写入的结果，校验用户身份后返回凭据并删除缓存。
+    """
     req = await request.json or {}
     source = request.args.get("type")
     if source not in ("google-drive", "gmail"):
@@ -525,6 +561,11 @@ async def poll_google_web_result():
 @manager.route("/connectors/box/oauth/web/start", methods=["POST"])  # noqa: F821
 @login_required
 async def start_box_web_oauth():
+    """启动 Box OAuth Web 授权流程，返回 Box 授权 URL。
+
+    需要客户端提供 client_id 和 client_secret。
+    将 OAuth 中间状态缓存到 Redis。
+    """
     req = await get_request_json()
 
     client_id = req.get("client_id")
@@ -567,6 +608,7 @@ async def start_box_web_oauth():
 
 @manager.route("/connectors/box/oauth/web/callback", methods=["GET"])  # noqa: F821
 async def box_web_oauth_callback():
+    """Box OAuth 回调端点，用授权码换取 access_token/refresh_token 并存入 Redis。"""
     flow_id = request.args.get("state")
     if not flow_id:
         return await _render_web_oauth_popup("", False, "Missing OAuth parameters.", "box")
@@ -611,6 +653,10 @@ async def box_web_oauth_callback():
 @login_required
 @validate_request("flow_id")
 async def poll_box_web_result():
+    """前端轮询此端点，获取 Box OAuth 授权完成后的凭据。
+
+    从 Redis 读取回调阶段写入的结果，校验用户身份后返回凭据并删除缓存。
+    """
     req = await get_request_json()
     flow_id = req.get("flow_id")
 

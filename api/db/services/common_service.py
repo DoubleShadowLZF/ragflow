@@ -13,6 +13,19 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+通用数据库服务基类。
+
+本模块提供所有服务类的基类 ``CommonService``，封装了基于 Peewee ORM 的标准 CRUD
+操作和通用数据库查询模式。所有业务服务类（如 ``ConnectorService``、``DocumentService``
+等）均继承自此基类。
+
+同时提供数据库操作的重试机制：
+
+- ``retry_db_operation`` — 基于 tenacity 库的指数退避重试装饰器。
+- ``retry_deadlock_operation`` — 专门处理 MySQL/OceanBase 死锁（错误码 1213）的重试。
+- ``_is_deadlock_error`` — 判断 OperationalError 是否为死锁错误。
+"""
 import logging
 import time
 from datetime import datetime
@@ -28,11 +41,15 @@ from common.time_utils import current_timestamp, datetime_format
 
 
 def _is_deadlock_error(exc: OperationalError) -> bool:
+    """判断 OperationalError 是否为 MySQL/OceanBase 死锁错误（错误码 1213）。"""
     return isinstance(exc, OperationalError) and bool(getattr(exc, "args", ())) and exc.args[0] == 1213
 
 
 def retry_deadlock_operation(max_retries=3, retry_delay=0.1):
-    """Retry a full DB operation when MySQL/OceanBase aborts it due to deadlock."""
+    """当 MySQL/OceanBase 因死锁中止操作时，自动重试整个数据库操作。
+
+    重试延迟按指数增长（2^n），最多重试 ``max_retries`` 次。
+    """
 
     def decorator(func):
         @wraps(func)
@@ -59,6 +76,11 @@ def retry_deadlock_operation(max_retries=3, retry_delay=0.1):
 
 
 def retry_db_operation(func):
+    """数据库操作重试装饰器。
+
+    基于 tenacity 库，在遇到 InterfaceError 或 OperationalError 时
+    自动重试，最多 3 次，采用指数退避策略（1s ~ 5s）。
+    """
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=5),
@@ -72,15 +94,13 @@ def retry_db_operation(func):
 
 
 class CommonService:
-    """Base service class that provides common database operations.
+    """通用服务基类 — 提供标准的 CRUD 操作和通用数据库查询模式。
 
-    This class serves as a foundation for all service classes in the application,
-    implementing standard CRUD operations and common database query patterns.
-    It uses the Peewee ORM for database interactions and provides a consistent
-    interface for database operations across all derived service classes.
+    所有业务服务类均继承自此基类，使用 Peewee ORM 与数据库交互。
+    子类须设置 ``model`` 属性以指定操作的 Peewee 模型。
 
     Attributes:
-        model: The Peewee model class that this service operates on. Must be set by subclasses.
+        model: 该服务所操作的 Peewee 模型类，子类必须覆盖此属性。
     """
 
     model = None
@@ -88,39 +108,33 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def query(cls, cols=None, reverse=None, order_by=None, **kwargs):
-        """Execute a database query with optional column selection and ordering.
-
-        This method provides a flexible way to query the database with various filters
-        and sorting options. It supports column selection, sort order control, and
-        additional filter conditions.
+        """执行数据库查询，支持列选择与排序。
 
         Args:
-            cols (list, optional): List of column names to select. If None, selects all columns.
-            reverse (bool, optional): If True, sorts in descending order. If False, sorts in ascending order.
-            order_by (str, optional): Column name to sort results by.
-            **kwargs: Additional filter conditions passed as keyword arguments.
+            cols: 要选择的列名列表，为 None 则选择全部列。
+            reverse: True 降序，False 升序。
+            order_by: 排序字段名。
+            **kwargs: 额外的过滤条件。
 
         Returns:
-            peewee.ModelSelect: A query result containing matching records.
+            peewee.ModelSelect: 匹配记录的查询结果。
         """
         return cls.model.query(cols=cols, reverse=reverse, order_by=order_by, **kwargs)
 
     @classmethod
     @DB.connection_context()
     def get_all(cls, cols=None, reverse=None, order_by=None):
-        """Retrieve all records from the database with optional column selection and ordering.
+        """获取表中全部记录，支持列选择和排序。
 
-        This method fetches all records from the model's table with support for
-        column selection and result ordering. If no order_by is specified and reverse
-        is True, it defaults to ordering by create_time.
+        若未指定 order_by 但指定了 reverse，则默认按 create_time 排序。
 
         Args:
-            cols (list, optional): List of column names to select. If None, selects all columns.
-            reverse (bool, optional): If True, sorts in descending order. If False, sorts in ascending order.
-            order_by (str, optional): Column name to sort results by. Defaults to 'create_time' if reverse is specified.
+            cols: 要选择的列名列表，为 None 则选择全部列。
+            reverse: True 降序，False 升序。
+            order_by: 排序字段名，未指定时默认为 create_time。
 
         Returns:
-            peewee.ModelSelect: A query containing all matching records.
+            peewee.ModelSelect: 包含全部匹配记录的查询。
         """
         if cols:
             query_records = cls.model.select(*cols)
@@ -138,35 +152,29 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def get(cls, **kwargs):
-        """Get a single record matching the given criteria.
-
-        This method retrieves a single record from the database that matches
-        the specified filter conditions.
+        """获取匹配条件的单条记录。
 
         Args:
-            **kwargs: Filter conditions as keyword arguments.
+            **kwargs: 过滤条件。
 
         Returns:
-            Model instance: Single matching record.
+            Model instance: 匹配的单条记录。
 
         Raises:
-            peewee.DoesNotExist: If no matching record is found.
+            peewee.DoesNotExist: 未找到匹配记录时抛出。
         """
         return cls.model.get(**kwargs)
 
     @classmethod
     @DB.connection_context()
     def get_or_none(cls, **kwargs):
-        """Get a single record or None if not found.
-
-        This method attempts to retrieve a single record matching the given criteria,
-        returning None if no match is found instead of raising an exception.
+        """获取匹配条件的单条记录，未找到时返回 None 而不抛出异常。
 
         Args:
-            **kwargs: Filter conditions as keyword arguments.
+            **kwargs: 过滤条件。
 
         Returns:
-            Model instance or None: Matching record if found, None otherwise.
+            Model instance or None: 匹配记录或 None。
         """
         try:
             return cls.model.get(**kwargs)
@@ -176,16 +184,13 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def save(cls, **kwargs):
-        """Save a new record to database.
-
-        This method creates a new record in the database with the provided field values,
-        forcing an insert operation rather than an update.
+        """保存新记录到数据库（强制 INSERT 而非 UPDATE）。
 
         Args:
-            **kwargs: Record field values as keyword arguments.
+            **kwargs: 记录字段值。
 
         Returns:
-            Model instance: The created record object.
+            Model instance: 创建后的记录对象。
         """
         sample_obj = cls.model(**kwargs).save(force_insert=True)
         return sample_obj
@@ -193,16 +198,13 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def insert(cls, **kwargs):
-        """Insert a new record with automatic ID and timestamps.
-
-        This method creates a new record with automatically generated ID and timestamp fields.
-        It handles the creation of create_time, create_date, update_time, and update_date fields.
+        """插入新记录，自动生成 ID 及 create_time/create_date/update_time/update_date 时间戳。
 
         Args:
-            **kwargs: Record field values as keyword arguments.
+            **kwargs: 记录字段值。
 
         Returns:
-            Model instance: The newly created record object.
+            Model instance: 新创建的记录对象。
         """
         if "id" not in kwargs:
             kwargs["id"] = get_uuid()
@@ -218,14 +220,13 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def insert_many(cls, data_list, batch_size=100):
-        """Insert multiple records in batches.
+        """批量插入多条记录，自动设置创建时间戳。
 
-        This method efficiently inserts multiple records into the database using batch processing.
-        It automatically sets creation timestamps for all records.
+        在事务中以 ``batch_size`` 为一批次分批执行。
 
         Args:
-            data_list (list): List of dictionaries containing record data to insert.
-            batch_size (int, optional): Number of records to insert in each batch. Defaults to 100.
+            data_list: 包含待插入记录数据的字典列表。
+            batch_size: 每批次插入的记录数，默认 100。
         """
         current_ts = current_timestamp()
         current_datetime = datetime_format(datetime.now())
@@ -242,14 +243,10 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def update_many_by_id(cls, data_list):
-        """Update multiple records by their IDs.
-
-        This method updates multiple records in the database, identified by their IDs.
-        It automatically updates the update_time and update_date fields for each record.
+        """根据 ID 批量更新多条记录，自动刷新 update_time 和 update_date。
 
         Args:
-            data_list (list): List of dictionaries containing record data to update.
-                             Each dictionary must include an 'id' field.
+            data_list: 包含待更新数据的字典列表，每条字典必须包含 'id' 字段。
         """
 
         timestamp = current_timestamp()
@@ -265,12 +262,15 @@ class CommonService:
     @DB.connection_context()
     @retry_db_operation
     def update_by_id(cls, pid, data):
-        # Update a single record by ID
-        # Args:
-        #     pid: Record ID
-        #     data: Updated field values
-        # Returns:
-        #     Number of records updated
+        """根据 ID 更新单条记录，自动刷新 update_time 和 update_date。
+
+        Args:
+            pid: 记录 ID。
+            data: 待更新的字段值。
+
+        Returns:
+            更新的记录数。
+        """
         data["update_time"] = current_timestamp()
         data["update_date"] = datetime_format(datetime.now())
         num = cls.model.update(data).where(cls.model.id == pid).execute()
@@ -279,11 +279,14 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def get_by_id(cls, pid):
-        # Get a record by ID
-        # Args:
-        #     pid: Record ID
-        # Returns:
-        #     Tuple of (success, record)
+        """根据 ID 获取单条记录。
+
+        Args:
+            pid: 记录 ID。
+
+        Returns:
+            (success, record) 元组。
+        """
         try:
             obj = cls.model.get_or_none(cls.model.id == pid)
             if obj:
@@ -295,12 +298,15 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def get_by_ids(cls, pids, cols=None):
-        # Get multiple records by their IDs
-        # Args:
-        #     pids: List of record IDs
-        #     cols: List of columns to select
-        # Returns:
-        #     Query of matching records
+        """根据 ID 列表批量获取记录。
+
+        Args:
+            pids: 记录 ID 列表。
+            cols: 要选择的列名列表。
+
+        Returns:
+            匹配记录的查询对象。
+        """
         if cols:
             objs = cls.model.select(*cols)
         else:
@@ -310,21 +316,27 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def delete_by_id(cls, pid):
-        # Delete a record by ID
-        # Args:
-        #     pid: Record ID
-        # Returns:
-        #     Number of records deleted
+        """根据 ID 删除单条记录。
+
+        Args:
+            pid: 记录 ID。
+
+        Returns:
+            删除的记录数。
+        """
         return cls.model.delete().where(cls.model.id == pid).execute()
 
     @classmethod
     @DB.connection_context()
     def delete_by_ids(cls, pids):
-        # Delete multiple records by their IDs
-        # Args:
-        #     pids: List of record IDs
-        # Returns:
-        #     Number of records deleted
+        """根据 ID 列表批量删除记录，在事务中执行。
+
+        Args:
+            pids: 记录 ID 列表。
+
+        Returns:
+            删除的记录数。
+        """
         with DB.atomic():
             res = cls.model.delete().where(cls.model.id.in_(pids)).execute()
             return res
@@ -332,11 +344,14 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def filter_delete(cls, filters):
-        # Delete records matching given filters
-        # Args:
-        #     filters: List of filter conditions
-        # Returns:
-        #     Number of records deleted
+        """根据过滤条件删除记录，在事务中执行。
+
+        Args:
+            filters: Peewee 过滤条件列表。
+
+        Returns:
+            删除的记录数。
+        """
         with DB.atomic():
             num = cls.model.delete().where(*filters).execute()
             return num
@@ -344,23 +359,29 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def filter_update(cls, filters, update_data):
-        # Update records matching given filters
-        # Args:
-        #     filters: List of filter conditions
-        #     update_data: Updated field values
-        # Returns:
-        #     Number of records updated
+        """根据过滤条件更新记录，在事务中执行。
+
+        Args:
+            filters: Peewee 过滤条件列表。
+            update_data: 待更新的字段值。
+
+        Returns:
+            更新的记录数。
+        """
         with DB.atomic():
             return cls.model.update(update_data).where(*filters).execute()
 
     @staticmethod
     def cut_list(tar_list, n):
-        # Split a list into chunks of size n
-        # Args:
-        #     tar_list: List to split
-        #     n: Chunk size
-        # Returns:
-        #     List of tuples containing chunks
+        """将列表按指定大小切分为多个元组。
+
+        Args:
+            tar_list: 待切分的列表。
+            n: 每个分块的大小。
+
+        Returns:
+            包含各分块元组的列表。
+        """
         length = len(tar_list)
         arr = range(length)
         result = [tuple(tar_list[x : (x + n)]) for x in arr[::n]]
@@ -369,14 +390,19 @@ class CommonService:
     @classmethod
     @DB.connection_context()
     def filter_scope_list(cls, in_key, in_filters_list, filters=None, cols=None):
-        # Get records matching IN clause filters with optional column selection
-        # Args:
-        #     in_key: Field name for IN clause
-        #     in_filters_list: List of values for IN clause
-        #     filters: Additional filter conditions
-        #     cols: List of columns to select
-        # Returns:
-        #     List of matching records
+        """使用 IN 子句批量查询记录，支持可选列选择和额外过滤条件。
+
+        为避免单个 IN 子句过长，内部自动按每 20 个值进行分片查询。
+
+        Args:
+            in_key: IN 子句的字段名。
+            in_filters_list: IN 子句的值列表。
+            filters: 额外的 Peewee 过滤条件。
+            cols: 要选择的列名列表。
+
+        Returns:
+            匹配记录的列表。
+        """
         in_filters_tuple_list = cls.cut_list(in_filters_list, 20)
         if not filters:
             filters = []
