@@ -13,6 +13,16 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+Langfuse API 密钥管理模块
+
+提供租户级别的 Langfuse API 密钥 CRUD 接口：
+- POST/PUT: 创建或更新 Langfuse 密钥（需验证密钥有效性）
+- GET: 查询已配置的 Langfuse 密钥及关联的项目信息
+- DELETE: 删除已配置的 Langfuse 密钥
+
+Langfuse 是一个开源 LLM 可观测性平台，RAGFlow 集成它来追踪 Agent 调用链路和 Token 消耗。
+"""
 
 
 from api.apps import current_user, login_required
@@ -27,6 +37,13 @@ from api.utils.api_utils import get_error_data_result, get_json_result, get_requ
 @login_required
 @validate_request("secret_key", "public_key", "host")
 async def set_api_key():
+    """创建或更新当前租户的 Langfuse API 密钥。
+
+    流程：
+    1. 校验必填字段（secret_key、public_key、host）
+    2. 使用提供的密钥向 Langfuse 发起认证检查
+    3. 若认证通过，写入或更新数据库（使用事务保证原子性）
+    """
     req = await get_request_json()
     secret_key = req.get("secret_key", "")
     public_key = req.get("public_key", "")
@@ -42,10 +59,12 @@ async def set_api_key():
         host=host,
     )
 
+    # 先向 Langfuse 验证密钥是否有效
     langfuse = Langfuse(public_key=langfuse_keys["public_key"], secret_key=langfuse_keys["secret_key"], host=langfuse_keys["host"])
     if not langfuse.auth_check():
         return get_error_data_result(message="Invalid Langfuse keys")
 
+    # 数据库事务：不存在则创建，已存在则更新
     langfuse_entry = TenantLangfuseService.filter_by_tenant(tenant_id=current_user_id)
     with DB.atomic():
         try:
@@ -62,6 +81,12 @@ async def set_api_key():
 @login_required
 @validate_request()
 def get_api_key():
+    """查询当前租户已配置的 Langfuse API 密钥。
+
+    不仅返回密钥信息，还会：
+    1. 验证密钥是否仍然有效
+    2. 查询关联的 Langfuse 项目 ID 和名称
+    """
     current_user_id = current_user.id
     langfuse_entry = TenantLangfuseService.filter_by_tenant_with_info(tenant_id=current_user_id)
     if not langfuse_entry:
@@ -76,6 +101,7 @@ def get_api_key():
     except Exception as e:
         return server_error_response(e)
 
+    # 从 Langfuse API 获取关联的项目信息
     langfuse_entry["project_id"] = langfuse.api.projects.get().dict()["data"][0]["id"]
     langfuse_entry["project_name"] = langfuse.api.projects.get().dict()["data"][0]["name"]
 
@@ -86,6 +112,7 @@ def get_api_key():
 @login_required
 @validate_request()
 def delete_api_key():
+    """删除当前租户已配置的 Langfuse API 密钥。"""
     current_user_id = current_user.id
     langfuse_entry = TenantLangfuseService.filter_by_tenant(tenant_id=current_user_id)
     if not langfuse_entry:
