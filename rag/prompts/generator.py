@@ -29,16 +29,31 @@ from rag.prompts.template import load_prompt
 from common.constants import TAG_FLD
 from common.token_utils import encoder, num_tokens_from_string
 
+# 停止 token，用于标识对话生成的结束
 STOP_TOKEN = "<|STOP|>"
+# 任务完成标记，Agent 调用此函数表示任务已完成
 COMPLETE_TASK = "complete_task"
+# 输入利用率：prompt 中用于实际输入的 token 预算比例
 INPUT_UTILIZATION = 0.5
 
 
 def get_value(d, k1, k2):
+    """
+    从字典中按优先级获取值：优先使用 k1，如果不存在则回退到 k2。
+    用于兼容不同数据源中字段名不一致的情况（如 chunk_id vs id）。
+    """
     return d.get(k1, d.get(k2))
 
 
 def chunks_format(reference):
+    """
+    将检索结果中的原始 chunk 数据标准化为统一格式。
+
+    主要工作：
+    1. 统一字段命名（兼容 chunk_id/id、content/content_with_weight 等多种字段名变体）
+    2. 过滤非法数据（非 dict 类型的 chunk）
+    3. 确保下游代码使用一致的字段名访问 chunk 数据
+    """
     if not reference or not isinstance(reference, dict):
         return []
     raw_chunks = reference.get("chunks", [])
@@ -174,6 +189,14 @@ def message_fit_in(msg, max_length=4000):
 
 
 def kb_prompt(kbinfos, max_tokens, hash_id=False):
+    """
+    将知识库检索结果格式化为 LLM prompt 可用的文本片段。
+
+    处理流程：
+    1. 按 max_tokens 的 97% 限制截断内容，防止超出模型上下文
+    2. 为每个 chunk 生成树形结构的文本表示（ID、标题、URL、元数据、内容）
+    3. hash_id 为 True 时对 chunk ID 做哈希处理，避免暴露原始 ID
+    """
     knowledges = [get_value(ck, "content", "content_with_weight") for ck in kbinfos["chunks"]]
     kwlg_len = len(knowledges)
     used_token_count = 0
@@ -211,6 +234,12 @@ def kb_prompt(kbinfos, max_tokens, hash_id=False):
 
 
 def memory_prompt(message_list, max_tokens):
+    """
+    将对话历史消息列表按 token 预算截断，返回能放入上下文的内容列表。
+
+    从最早的消息开始累加，当累计 token 数超过 max_tokens 的 97% 时停止，
+    确保不会超出模型上下文窗口限制。
+    """
     used_token_count = 0
     content_list = []
     for message in message_list:
@@ -223,39 +252,53 @@ def memory_prompt(message_list, max_tokens):
     return content_list
 
 
-CITATION_PROMPT_TEMPLATE = load_prompt("citation_prompt")
-CITATION_PLUS_TEMPLATE = load_prompt("citation_plus")
-CONTENT_TAGGING_PROMPT_TEMPLATE = load_prompt("content_tagging_prompt")
-CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE = load_prompt("cross_languages_sys_prompt")
-CROSS_LANGUAGES_USER_PROMPT_TEMPLATE = load_prompt("cross_languages_user_prompt")
+# ============================================================
+# 提示词模板加载
+# 所有模板通过 load_prompt() 从外部文件加载，支持热更新
+# ============================================================
+
+# 基础检索与回答相关模板
+CITATION_PROMPT_TEMPLATE = load_prompt("citation_prompt")           # 引用指南模板
+CITATION_PLUS_TEMPLATE = load_prompt("citation_plus")               # 增强引用模板（含示例）
+CONTENT_TAGGING_PROMPT_TEMPLATE = load_prompt("content_tagging_prompt")  # 内容标签提取模板
+CROSS_LANGUAGES_SYS_PROMPT_TEMPLATE = load_prompt("cross_languages_sys_prompt")      # 跨语言翻译系统提示词
+CROSS_LANGUAGES_USER_PROMPT_TEMPLATE = load_prompt("cross_languages_user_prompt")    # 跨语言翻译用户提示词
 FULL_QUESTION_PROMPT_TEMPLATE = load_prompt("full_question_prompt") # 多轮对话精炼的提示词模板，用于指导 LLM 将对话中的最后一轮问题转化为一个完整的、自包含的问题。
-KEYWORD_PROMPT_TEMPLATE = load_prompt("keyword_prompt")
-QUESTION_PROMPT_TEMPLATE = load_prompt("question_prompt")
-VISION_LLM_DESCRIBE_PROMPT = load_prompt("vision_llm_describe_prompt")
-VISION_LLM_FIGURE_DESCRIBE_PROMPT = load_prompt("vision_llm_figure_describe_prompt")
-VISION_LLM_FIGURE_DESCRIBE_PROMPT_WITH_CONTEXT = load_prompt("vision_llm_figure_describe_prompt_with_context")
-STRUCTURED_OUTPUT_PROMPT = load_prompt("structured_output_prompt")
+KEYWORD_PROMPT_TEMPLATE = load_prompt("keyword_prompt")             # 关键词提取模板
+QUESTION_PROMPT_TEMPLATE = load_prompt("question_prompt")           # 问题生成模板
+VISION_LLM_DESCRIBE_PROMPT = load_prompt("vision_llm_describe_prompt")                     # 视觉模型图片描述模板
+VISION_LLM_FIGURE_DESCRIBE_PROMPT = load_prompt("vision_llm_figure_describe_prompt")       # 视觉模型图表描述模板
+VISION_LLM_FIGURE_DESCRIBE_PROMPT_WITH_CONTEXT = load_prompt("vision_llm_figure_describe_prompt_with_context")  # 带上下文的图表描述模板
+STRUCTURED_OUTPUT_PROMPT = load_prompt("structured_output_prompt")  # 结构化输出模板
 
-ANALYZE_TASK_SYSTEM = load_prompt("analyze_task_system")
-ANALYZE_TASK_USER = load_prompt("analyze_task_user")
-NEXT_STEP = load_prompt("next_step")
-REFLECT = load_prompt("reflect")
-SUMMARY4MEMORY = load_prompt("summary4memory")
-RANK_MEMORY = load_prompt("rank_memory")
-META_FILTER = load_prompt("meta_filter")
-ASK_SUMMARY = load_prompt("ask_summary")
+# Agent 工作流相关模板
+ANALYZE_TASK_SYSTEM = load_prompt("analyze_task_system")    # 任务分析系统提示词
+ANALYZE_TASK_USER = load_prompt("analyze_task_user")        # 任务分析用户提示词
+NEXT_STEP = load_prompt("next_step")                        # 下一步动作决策模板
+REFLECT = load_prompt("reflect")                            # 反思/自我评估模板
+SUMMARY4MEMORY = load_prompt("summary4memory")              # 工具调用结果摘要（存入记忆）
+RANK_MEMORY = load_prompt("rank_memory")                    # 记忆排序模板
+META_FILTER = load_prompt("meta_filter")                    # 元数据过滤条件生成模板
+ASK_SUMMARY = load_prompt("ask_summary")                    # 问询摘要模板
 
+# Jinja2 沙箱环境，用于安全渲染提示词模板（禁止执行任意 Python 代码）
 PROMPT_JINJA_ENV = SandboxedEnvironment(
     autoescape=False, trim_blocks=True, lstrip_blocks=True
 )
 
 
 def citation_prompt(user_defined_prompts: dict = {}) -> str:
+    """
+    生成引用指南 prompt：如果用户自定义了引用规则则使用之，否则使用默认模板。
+    """
     template = PROMPT_JINJA_ENV.from_string(user_defined_prompts.get("citation_guidelines", CITATION_PROMPT_TEMPLATE))
     return template.render()
 
 
 def citation_plus(sources: str) -> str:
+    """
+    生成带来源列表的增强引用 prompt，用于指导 LLM 在回答中正确标注引用来源。
+    """
     template = PROMPT_JINJA_ENV.from_string(CITATION_PLUS_TEMPLATE)
     return template.render(example=citation_prompt(), sources=sources)
 
@@ -279,6 +322,12 @@ async def keyword_extraction(chat_mdl, content, topn=3):
 
 
 async def question_proposal(chat_mdl, content, topn=3):
+    """
+    根据给定文本内容生成 Top-N 个相关问题。
+
+    用途：在知识库构建阶段，为每个文档 chunk 自动生成潜在用户问题，
+    用于后续的 Q2Q（Question-to-Question）检索增强。
+    """
     template = PROMPT_JINJA_ENV.from_string(QUESTION_PROMPT_TEMPLATE)
     rendered_prompt = template.render(content=content, topn=topn)
 
@@ -399,6 +448,13 @@ async def cross_languages(tenant_id, llm_id, query, languages=[]):
 
 
 async def content_tagging(chat_mdl, content, all_tags, examples, topn=3):
+    """
+    使用 LLM 对内容进行自动标签分类。
+
+    将文本内容与预定义的标签集合进行语义匹配，返回匹配的标签及其权重。
+    支持提供示例（few-shot）以提高 LLM 标签分配的准确性。
+    解析失败时使用 json_repair 进行容错修复。
+    """
     template = PROMPT_JINJA_ENV.from_string(CONTENT_TAGGING_PROMPT_TEMPLATE)
 
     for ex in examples:
@@ -441,22 +497,31 @@ async def content_tagging(chat_mdl, content, all_tags, examples, topn=3):
 
 
 def vision_llm_describe_prompt(page=None) -> str:
+    """生成视觉模型图片描述 prompt，可指定页码。"""
     template = PROMPT_JINJA_ENV.from_string(VISION_LLM_DESCRIBE_PROMPT)
 
     return template.render(page=page)
 
 
 def vision_llm_figure_describe_prompt() -> str:
+    """生成视觉模型图表描述 prompt（无上下文版本）。"""
     template = PROMPT_JINJA_ENV.from_string(VISION_LLM_FIGURE_DESCRIBE_PROMPT)
     return template.render()
 
 
 def vision_llm_figure_describe_prompt_with_context(context_above: str, context_below: str) -> str:
+    """生成视觉模型图表描述 prompt（带上下文：上文 + 下文）。"""
     template = PROMPT_JINJA_ENV.from_string(VISION_LLM_FIGURE_DESCRIBE_PROMPT_WITH_CONTEXT)
     return template.render(context_above=context_above, context_below=context_below)
 
 
 def tool_schema(tools_description: list[dict], complete_task=False):
+    """
+    将工具描述列表格式化为 LLM 可理解的工具 schema 文本。
+
+    如果 complete_task=True，会在工具列表末尾追加一个 complete_task 函数定义，
+    让 Agent 可以通过调用该函数来标记任务完成并返回最终答案。
+    """
     if not tools_description:
         return ""
     desc = {}
@@ -483,6 +548,12 @@ def tool_schema(tools_description: list[dict], complete_task=False):
 
 
 def form_history(history, limit=-6):
+    """
+    将对话历史格式化为文本上下文。
+
+    默认取最后 6 轮对话（limit=-6），每条消息截断至 2048 字符，
+    角色映射：user → USER，其他 → AGENT。
+    """
     context = ""
     for h in history[limit:]:
         if h["role"] == "system":
@@ -496,6 +567,12 @@ def form_history(history, limit=-6):
 
 async def analyze_task_async(chat_mdl, prompt, task_name, tools_description: list[dict],
                              user_defined_prompts: dict = {}):
+    """
+    分析任务：让 LLM 理解任务目标、可用工具，并生成任务执行计划。
+
+    支持用户自定义任务分析模板（user_defined_prompts["task_analysis"]），
+    否则使用默认的 ANALYZE_TASK_SYSTEM + ANALYZE_TASK_USER 组合模板。
+    """
     tools_desc = tool_schema(tools_description)
     context = ""
 
@@ -515,6 +592,13 @@ async def analyze_task_async(chat_mdl, prompt, task_name, tools_description: lis
 
 async def next_step_async(chat_mdl, history: list, tools_description: list[dict], task_desc,
                           user_defined_prompts: dict = {}):
+    """
+    Agent 循环的核心决策函数：根据当前对话历史和任务分析，决定下一步调用哪个工具。
+
+    返回 LLM 的原始响应 JSON 字符串和消耗的 token 数。
+    如果无法继续执行或任务已完成，LLM 应返回 complete_task 调用。
+    支持用户自定义决策模板（user_defined_prompts["plan_generation"]）。
+    """
     if not tools_description:
         return "", 0
     desc = tool_schema(tools_description)
@@ -536,6 +620,12 @@ async def next_step_async(chat_mdl, history: list, tools_description: list[dict]
 
 
 async def reflect_async(chat_mdl, history: list[dict], tool_call_res: list[Tuple], user_defined_prompts: dict = {}):
+    """
+    Agent 反思函数：让 LLM 对工具调用结果进行反思和总结。
+
+    将工具调用的名称和结果提供给 LLM，生成包含 Observation（观察）和
+    Reflection（反思）两部分的结构化输出，帮助 Agent 评估当前进展。
+    """
     tool_calls = [{"name": p[0], "result": p[1]} for p in tool_call_res]
     goal = history[1]["content"]
     template = PROMPT_JINJA_ENV.from_string(user_defined_prompts.get("reflection", REFLECT))
@@ -558,15 +648,22 @@ async def reflect_async(chat_mdl, history: list[dict], tool_call_res: list[Tuple
 
 
 def form_message(system_prompt, user_prompt):
+    """构建标准的 system + user 消息列表，用于 LLM 调用。"""
     return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
 
 def structured_output_prompt(schema=None) -> str:
+    """生成结构化输出 prompt，指导 LLM 按 JSON 格式输出，可指定输出 schema。"""
     template = PROMPT_JINJA_ENV.from_string(STRUCTURED_OUTPUT_PROMPT)
     return template.render(schema=schema)
 
 
 async def tool_call_summary(chat_mdl, name: str, params: dict, result: str, user_defined_prompts: dict = {}) -> str:
+    """
+    对单次工具调用的结果进行摘要，存入 Agent 的长期记忆。
+
+    将工具名称、参数和返回结果压缩为简洁摘要，减少后续对话中的 token 消耗。
+    """
     template = PROMPT_JINJA_ENV.from_string(SUMMARY4MEMORY)
     system_prompt = template.render(name=name,
                                     params=json.dumps(params, ensure_ascii=False, indent=2),
@@ -579,6 +676,12 @@ async def tool_call_summary(chat_mdl, name: str, params: dict, result: str, user
 
 async def rank_memories_async(chat_mdl, goal: str, sub_goal: str, tool_call_summaries: list[str],
                               user_defined_prompts: dict = {}):
+    """
+    对记忆条目进行相关性排序。
+
+    根据当前目标和子目标，对多个工具调用摘要进行评分排序，
+    返回排序后的结果列表（从最相关到最不相关）。
+    """
     template = PROMPT_JINJA_ENV.from_string(RANK_MEMORY)
     system_prompt = template.render(goal=goal, sub_goal=sub_goal,
                                     results=[{"i": i, "content": s} for i, s in enumerate(tool_call_summaries)])
@@ -685,6 +788,11 @@ TOC_DETECTION = load_prompt("toc_detection")
 
 
 async def detect_table_of_contents(page_1024: list[str], chat_mdl):
+    """
+    检测文档目录页：从文档前 22 页中识别哪些页面包含目录。
+
+    逐页调用 LLM 判断该页是否包含目录结构，一旦连续出现不含目录的页面就停止检测。
+    """
     toc_secs = []
     for i, sec in enumerate(page_1024[:22]):
         ans = await gen_json(PROMPT_JINJA_ENV.from_string(TOC_DETECTION).render(page_txt=sec), "Only JSON please.",
@@ -700,6 +808,11 @@ TOC_EXTRACTION_CONTINUE = load_prompt("toc_extraction_continue")
 
 
 async def extract_table_of_contents(toc_pages, chat_mdl):
+    """
+    从目录页文本中提取结构化的目录数据（JSON 格式）。
+
+    将检测到的目录页拼接为一个整体，由 LLM 解析为包含 structure 和 title 的 JSON 数组。
+    """
     if not toc_pages:
         return []
 
@@ -708,6 +821,12 @@ async def extract_table_of_contents(toc_pages, chat_mdl):
 
 
 async def toc_index_extractor(toc: list[dict], content: str, chat_mdl):
+    """
+    为目录条目添加物理页码索引。
+
+    将 LLM 解析出的目录结构与文档页面中的 <physical_index_X> 标签进行匹配，
+    为每个目录条目补充实际页码信息。
+    """
     tob_extractor_prompt = """
     You are given a table of contents in a json format and several pages of a document, your job is to add the physical_index to the table of contents in the json format.
 
@@ -738,6 +857,15 @@ TOC_INDEX = load_prompt("toc_index")
 
 
 async def table_of_contents_index(toc_arr: list[dict], sections: list[str], chat_mdl):
+    """
+    将目录结构映射到文档实际章节位置。
+
+    核心算法：
+    1. 建立目录标题到索引的映射（支持空格压缩匹配）
+    2. 先通过精确文本匹配定位章节
+    3. 对于未匹配的条目，使用 DFS 搜索 + LLM 语义匹配进行补全
+    4. 选择最长的匹配路径作为最终结果
+    """
     if not toc_arr or not sections:
         return []
 
@@ -824,6 +952,10 @@ async def table_of_contents_index(toc_arr: list[dict], sections: list[str], chat
 
 
 async def check_if_toc_transformation_is_complete(content, toc, chat_mdl):
+    """
+    检查目录转换是否完整：让 LLM 对比原始目录和转换后的 JSON 目录，
+    判断是否所有章节都已被正确提取。
+    """
     prompt = """
     You are given a raw table of contents and a  table of contents.
     Your job is to check if the  table of contents is complete.
@@ -841,6 +973,15 @@ async def check_if_toc_transformation_is_complete(content, toc, chat_mdl):
 
 
 async def toc_transformer(toc_pages, chat_mdl):
+    """
+    将原始目录文本转换为结构化 JSON 格式。
+
+    采用分段转换 + 完整性检查 + 循环补全的策略：
+    1. 初次转换：一次性转换整个目录
+    2. 完整性检查：由 LLM 验证是否所有章节都已提取
+    3. 循环补全：如果不完整，从上次中断处继续转换，直到全部完成
+    同时清洗标题中的冗余字符（如省略号）。
+    """
     init_prompt = """
     You are given a table of contents, You job is to transform the whole table of content into a JSON format included table_of_contents.
 
@@ -901,6 +1042,11 @@ TOC_LEVELS = load_prompt("assign_toc_levels")
 
 
 async def assign_toc_levels(toc_secs, chat_mdl, gen_conf={"temperature": 0.2}):
+    """
+    为目录条目分配层级编号（如 1, 1.1, 1.1.1），构建文档的层级结构。
+
+    输入为扁平的章节标题列表，LLM 根据语义推断嵌套关系并输出带 level 的结构化数据。
+    """
     if not toc_secs:
         return []
     return await gen_json(
@@ -915,8 +1061,13 @@ TOC_FROM_TEXT_SYSTEM = load_prompt("toc_from_text_system")
 TOC_FROM_TEXT_USER = load_prompt("toc_from_text_user")
 
 
-# Generate TOC from text chunks with text llms
+# 从文本块生成目录（使用文本 LLM，非视觉模型）
 async def gen_toc_from_text(txt_info: dict, chat_mdl, callback=None):
+    """
+    从文本块中提取目录结构（用于纯文本文档，无需 OCR/视觉模型）。
+
+    将多个 chunk 拼接为 JSON 文本输入 LLM，提取其中的章节标题和层级关系。
+    """
     if callback:
         callback(msg="")
     try:
@@ -934,8 +1085,10 @@ async def gen_toc_from_text(txt_info: dict, chat_mdl, callback=None):
 
 def split_chunks(chunks, max_length: int):
     """
-    Pack chunks into batches according to max_length, returning [{"id": idx, "text": chunk_text}, ...].
-    Do not split a single chunk, even if it exceeds max_length.
+    按 max_length 将 chunk 分批次打包，返回 [{"id": idx, "text": chunk_text}, ...] 格式。
+
+    关键规则：单个 chunk 即使超过 max_length 也不会被拆分（原子性保证）。
+    批次累计 token 数达到 max_length 时自动截断，开始新批次。
     """
 
     result = []
@@ -954,6 +1107,16 @@ def split_chunks(chunks, max_length: int):
 
 
 async def run_toc_from_text(chunks, chat_mdl, callback=None):
+    """
+    从文本 chunk 列表中生成完整目录（入口函数）。
+
+    整体流程：
+    1. 计算输入 token 预算（max_length * 50% 减去模板固定开销）
+    2. 将 chunks 分批并行发送给 LLM 提取目录
+    3. 过滤无效条目（title 为空/-1、纯数字标点、过长标题）
+    4. 调用 assign_toc_levels 为过滤后的条目分配层级
+    5. 合并层级信息与 chunk_id，返回最终目录结构
+    """
     input_budget = int(chat_mdl.max_length * INPUT_UTILIZATION) - num_tokens_from_string(
         TOC_FROM_TEXT_USER + TOC_FROM_TEXT_SYSTEM
     )
@@ -1100,6 +1263,12 @@ async def relevant_chunks_with_toc(query: str, toc: list[dict], chat_mdl, topn: 
 
 META_DATA = load_prompt("meta_data")
 async def gen_metadata(chat_mdl, schema: dict, content: str):
+    """
+    使用 LLM 从文档内容中提取结构化元数据。
+
+    根据提供的 JSON Schema 定义，从文本中提取字段值。
+    如果 schema 中的字段定义了 enum 约束，会在 prompt 中强调 LLM 必须从中选择。
+    """
     if not schema:
         return ""
     if "properties" not in schema:
@@ -1120,6 +1289,12 @@ async def gen_metadata(chat_mdl, schema: dict, content: str):
 
 SUFFICIENCY_CHECK = load_prompt("sufficiency_check")
 async def sufficiency_check(chat_mdl, question: str, ret_content: str):
+    """
+    充分性检查：判断已检索到的内容是否足以回答用户问题。
+
+    用于深度研究场景，LLM 评估当前检索结果的信息完整度，
+    返回是否充分以及缺失的信息类型。
+    """
     try:
         return await gen_json(
             PROMPT_JINJA_ENV.from_string(SUFFICIENCY_CHECK).render(question=question, retrieved_docs=ret_content),
