@@ -13,6 +13,21 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+版面/表格识别测试脚本
+
+支持两种识别模式：
+- layout: 版面布局识别 — 检测文本、标题、表格、图片等区域
+- tsr: 表格结构识别 — 检测表格的行、列、表头、合并单元格，并生成 HTML 表格
+
+用法:
+    python t_recognizer.py --inputs <图片/PDF路径> --mode layout --threshold 0.5
+    python t_recognizer.py --inputs <图片/PDF路径> --mode tsr --threshold 0.5
+
+输出:
+    - layout 模式: 绘制了版面检测框的图片
+    - tsr 模式: 图片 + 对应的 .html 表格文件
+"""
 
 import logging
 import os
@@ -34,6 +49,12 @@ import numpy as np
 
 
 def main(args):
+    """
+    主函数：执行版面识别或表格结构识别。
+
+    Args:
+        args: 命令行参数，包含 mode, threshold 等
+    """
     images, outputs = init_in_out(args)
     if args.mode.lower() == "layout":
         detr = LayoutRecognizer("layout")
@@ -44,7 +65,7 @@ def main(args):
         layouts = detr(images, thr=float(args.threshold))
     for i, lyt in enumerate(layouts):
         if args.mode.lower() == "tsr":
-            #lyt = [t for t in lyt if t["type"] == "table column"]
+            # TSR 模式：额外生成 HTML 表格
             html = get_table_html(images[i], lyt, ocr)
             with open(outputs[i] + ".html", "w+", encoding='utf-8') as f:
                 f.write(html)
@@ -59,6 +80,23 @@ def main(args):
 
 
 def get_table_html(img, tb_cpns, ocr):
+    """
+    根据表格结构识别结果构建 HTML 表格。
+
+    处理流程：
+    1. 对图像执行 OCR 获取所有文字块
+    2. 将文字块与表格的行、列、表头、合并单元格对齐
+    3. 调用 TableStructureRecognizer.construct_table 生成 HTML
+
+    Args:
+        img: 原始图像
+        tb_cpns: 表格结构组件列表（行、列、表头、合并单元格）
+        ocr: OCR 引擎实例
+
+    Returns:
+        str: HTML 表格字符串
+    """
+    # OCR 获取文字块并排序
     boxes = ocr(np.array(img))
     boxes = LayoutRecognizer.sort_Y_firstly(
         [{"x0": b[0][0], "x1": b[1][0],
@@ -70,12 +108,14 @@ def get_table_html(img, tb_cpns, ocr):
     )
 
     def gather(kwd, fzy=10, ption=0.6):
+        """按关键词筛选表格组件并按 Y 坐标排序"""
         nonlocal boxes
         eles = LayoutRecognizer.sort_Y_firstly(
             [r for r in tb_cpns if re.match(kwd, r["label"])], fzy)
         eles = LayoutRecognizer.layouts_cleanup(boxes, eles, 5, ption)
         return LayoutRecognizer.sort_Y_firstly(eles, 0)
 
+    # 分类提取表格组件：表头行、数据行、合并单元格、列
     headers = gather(r".*header$")
     rows = gather(r".* (row|header)")
     spans = gather(r".*spanning")
@@ -83,6 +123,7 @@ def get_table_html(img, tb_cpns, ocr):
         r"table column$", r["label"])], key=lambda x: x["x0"])
     clmns = LayoutRecognizer.layouts_cleanup(boxes, clmns, 5, 0.5)
 
+    # 将 OCR 文字块与表格结构对齐
     for b in boxes:
         ii = LayoutRecognizer.find_overlapped_with_threshold(b, rows, thr=0.3)
         if ii is not None:

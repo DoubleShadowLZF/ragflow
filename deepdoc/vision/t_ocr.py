@@ -13,6 +13,24 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+OCR 独立测试脚本
+
+用于对输入图像或 PDF 文件执行 OCR 文字检测与识别，并将结果可视化输出。
+支持多 GPU 并行加速。
+
+用法:
+    python t_ocr.py --inputs <图片/PDF路径或目录> --output_dir <输出目录>
+
+GPU 配置:
+    - 单 GPU:    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    - 多 GPU:    os.environ['CUDA_VISIBLE_DEVICES'] = '0,2'
+    - CPU 模式:  os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+输出:
+    - 绘制了 OCR 检测框的图片
+    - 对应的 .txt 文本文件
+"""
 
 import asyncio
 import logging
@@ -35,20 +53,35 @@ from deepdoc.vision import OCR, init_in_out
 import argparse
 import numpy as np
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0,2' #2 gpus, uncontinuous
-os.environ['CUDA_VISIBLE_DEVICES'] = '0' #1 gpu
-# os.environ['CUDA_VISIBLE_DEVICES'] = '' #cpu
+# GPU 设备配置：取消对应行注释即可切换模式
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0,2' # 多 GPU（不连续）
+os.environ['CUDA_VISIBLE_DEVICES'] = '0' # 单 GPU
+# os.environ['CUDA_VISIBLE_DEVICES'] = '' # CPU 模式
 
 
 def main(args):
+    """
+    主函数：执行 OCR 检测与识别。
+
+    流程：
+    1. 初始化 OCR 引擎
+    2. 加载输入图像/PDF
+    3. 使用异步协程并行处理所有页面（多 GPU 时使用信号量控制并发）
+    4. 将检测结果绘制到图像并保存
+
+    Args:
+        args: 命令行参数
+    """
     import torch.cuda
 
     cuda_devices = torch.cuda.device_count()
+    # 多 GPU 时，每个设备分配一个信号量控制并发
     limiter = [asyncio.Semaphore(1) for _ in range(cuda_devices)] if cuda_devices > 1 else None
     ocr = OCR()
     images, outputs = init_in_out(args)
 
     def __ocr(i, id, img):
+        """对单张图像执行 OCR，绘制结果并保存"""
         print("Task {} start".format(i))
         bxs = ocr(np.array(img), id)
         bxs = [(line[0], line[1][0]) for line in bxs]
@@ -65,6 +98,7 @@ def main(args):
         print("Task {} done".format(i))
 
     async def __ocr_thread(i, id, img, limiter = None):
+        """异步 OCR 任务包装器，支持信号量限流"""
         if limiter:
             async with limiter:
                 print(f"Task {i} use device {id}")
@@ -74,6 +108,7 @@ def main(args):
 
 
     async def __ocr_launcher():
+        """启动所有异步 OCR 任务"""
         tasks = []
         for i, img in enumerate(images):
             dev_id = i % cuda_devices if cuda_devices > 1 else 0

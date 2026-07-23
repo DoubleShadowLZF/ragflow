@@ -13,6 +13,22 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+deepdoc.vision 模块
+
+提供文档视觉处理的核心功能，包括：
+- OCR 文字检测与识别
+- 版面布局分析（文本、标题、表格、图片等区域识别）
+- 表格结构识别（行列、表头、合并单元格）
+- 图像预处理与后处理算子
+
+主要导出类：
+    OCR: 光学字符识别引擎
+    Recognizer: 版面/结构识别的基类
+    LayoutRecognizer: 版面布局识别器（基于 YOLOv10）
+    AscendLayoutRecognizer: 华为昇腾平台的版面识别器
+    TableStructureRecognizer: 表格结构识别器
+"""
 import io
 import sys
 import threading
@@ -25,12 +41,30 @@ from .layout_recognizer import AscendLayoutRecognizer
 from .layout_recognizer import LayoutRecognizer4YOLOv10 as LayoutRecognizer
 from .table_structure_recognizer import TableStructureRecognizer
 
+# 全局锁，用于保护 pdfplumber 的并发访问
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
 
 
 def init_in_out(args):
+    """
+    初始化输入图像和输出路径。
+
+    支持 PDF 和图片格式输入：
+    - PDF 文件会被转换为逐页图片（使用 pdfplumber）
+    - 图片文件直接加载为 RGB PIL Image
+
+    Args:
+        args: 命令行参数对象，需包含：
+            - inputs: 输入文件路径或目录
+            - output_dir: 输出目录路径
+
+    Returns:
+        tuple: (images, outputs)
+            - images: PIL Image 列表
+            - outputs: 对应的输出文件路径列表
+    """
     import os
     import traceback
 
@@ -45,6 +79,7 @@ def init_in_out(args):
         os.mkdir(args.output_dir)
 
     def pdf_pages(fnm, zoomin=3):
+        """将 PDF 文件转换为逐页图片列表"""
         nonlocal outputs, images
         with sys.modules[LOCK_KEY_pdfplumber]:
             pdf = pdfplumber.open(fnm)
@@ -55,6 +90,7 @@ def init_in_out(args):
         pdf.close()
 
     def images_and_outputs(fnm):
+        """处理单个输入文件，区分 PDF 和普通图片"""
         nonlocal outputs, images
         if fnm.split(".")[-1].lower() == "pdf":
             pdf_pages(fnm)

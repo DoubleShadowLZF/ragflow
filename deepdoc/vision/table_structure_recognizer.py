@@ -13,6 +13,25 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+表格结构识别模块
+
+提供表格结构识别功能，检测表格中的：
+- 表格整体区域（table）
+- 表格列（table column）
+- 表格行（table row）
+- 列标题（table column header）
+- 行标题（table projected row header）
+- 合并单元格（table spanning cell）
+
+识别结果可用于：
+- 将分散的 OCR 文字块组合为结构化的表格
+- 生成 HTML 表格（用于网页展示）
+- 输出描述性文本（用于 RAG 检索）
+
+支持 ONNX 和华为昇腾（Ascend）两种推理后端。
+"""
+
 import logging
 import os
 import re
@@ -28,6 +47,21 @@ from .recognizer import Recognizer
 
 
 class TableStructureRecognizer(Recognizer):
+    """
+    表格结构识别器。
+
+    识别表格的行、列、表头和合并单元格，支持：
+    - construct_table: 将识别结果构建为结构化的二维表格（HTML 或文本描述）
+    - blockType: 文本块类型分类（日期、数字、英文、中文等）
+    - __cal_spans: 计算合并单元格的跨行/跨列信息
+
+    通过环境变量 TABLE_STRUCTURE_RECOGNIZER_TYPE 切换后端：
+    - "onnx"（默认）: ONNX Runtime
+    - "ascend": 华为昇腾 NPU
+
+    Attributes:
+        labels: 表格元素类别标签
+    """
     labels = [
         "table",
         "table column",
@@ -52,6 +86,22 @@ class TableStructureRecognizer(Recognizer):
             )
 
     def __call__(self, images, thr=0.2):
+        """
+        执行表格结构识别。
+
+        流程：
+        1. 根据环境变量选择 ONNX 或 Ascend 后端
+        2. 运行表格结构检测模型
+        3. 对齐行框的左右边界和列框的上下边界（提升框的一致性）
+        4. 返回标准化后的表格组件列表
+
+        Args:
+            images: 图像列表（PIL Image 或 numpy 数组）
+            thr: 置信度阈值
+
+        Returns:
+            list: 每张图像的表格组件列表
+        """
         table_structure_recognizer_type = os.getenv("TABLE_STRUCTURE_RECOGNIZER_TYPE", "onnx").lower()
         if table_structure_recognizer_type not in ["onnx", "ascend"]:
             raise RuntimeError("Unsupported table structure recognizer type.")
@@ -112,6 +162,20 @@ class TableStructureRecognizer(Recognizer):
 
     @staticmethod
     def is_caption(bx):
+        """
+        判断文字块是否为表格/图片说明文字。
+
+        通过正则匹配检测 caption 特征：
+        - 中文图/表编号："图1"、"表2" 等
+        - 英文 Figure/Table 编号
+        - layout_type 中包含 "caption"
+
+        Args:
+            bx: 文字块字典，包含 text 和 layout_type
+
+        Returns:
+            bool: 是否为说明文字
+        """
         patt = [
             r"[图表]+[ 0-9:：]{2,}",
             r"(?i)Fig\.?\s*\d+",
@@ -124,6 +188,27 @@ class TableStructureRecognizer(Recognizer):
 
     @staticmethod
     def blockType(b):
+        """
+        对表格单元格文本进行类型分类。
+
+        分类标签：
+        - Dt: 日期（如 "2024年1月1日"、"2024Q1"）
+        - Nu: 纯数字（如 "123.45%"）
+        - Ca: 编号/代码（如 "ABC-123"）
+        - En: 英文单词（如 "Hello world"）
+        - NE: 数字+英文字母混合
+        - Sg: 单个字符
+        - Tx: 短文本（4~11 个词）
+        - Lx: 长文本（≥12 个词）
+        - Nr: 人名（单个词且词性为人名）
+        - Ot: 其他
+
+        Args:
+            b: 文字块字典，需包含 text 键和可能的 page_number 等属性
+
+        Returns:
+            str: 文本类型标签（两字符编码）
+        """
         patt = [
             ("^(20|19)[0-9]{2}[年/-][0-9]{1,2}[月/-][0-9]{1,2}日*$", "Dt"),
             (r"^(20|19)[0-9]{2}年$", "Dt"),
@@ -155,6 +240,27 @@ class TableStructureRecognizer(Recognizer):
 
     @staticmethod
     def construct_table(boxes, is_english=False, html=True, **kwargs):
+        """
+        将带有行列标记的文字块构建为结构化表格。
+
+        这是表格结构识别的核心算法，包含以下步骤：
+        1. 提取表格标题（caption）
+        2. 对文字块进行文本类型分类
+        3. 按行（R）分组构建行结构
+        4. 按列（C）分组构建列结构
+        5. 处理合并单元格（colspan / rowspan）
+        6. 移除单行/单列的孤立单元格
+        7. 输出 HTML 表格或文本描述
+
+        Args:
+            boxes: 已标记行列号和标题信息的文字块列表
+            is_english: 是否为英文表格
+            html: True 输出 HTML，False 输出文本描述
+            **kwargs: 额外参数
+
+        Returns:
+            str 或 list: HTML 表格字符串或文本行列表
+        """
         cap = ""
         i = 0
         while i < len(boxes):
@@ -499,7 +605,23 @@ class TableStructureRecognizer(Recognizer):
 
     @staticmethod
     def __cal_spans(boxes, rows, cols, tbl, html=True):
-        # caculate span
+        """
+        计算并处理合并单元格（colspan / rowspan）。
+
+        根据每个文字块的 spanning cell 信息，确定其跨越的行列范围，
+        并在表格中标记为 None（HTML 输出）或共享引用（文本输出）。
+
+        Args:
+            boxes: 文字块列表
+            rows: 行信息列表
+            cols: 列信息列表
+            tbl: 二维表格数组
+            html: 输出模式（True 为 HTML，False 为文本）
+
+        Returns:
+            list: 处理了合并单元格后的二维表格
+        """
+        # 计算列和行的边界位置
         clft = [np.mean([c.get("C_left", c["x0"]) for c in cln]) for cln in cols]
         crgt = [np.mean([c.get("C_right", c["x1"]) for c in cln]) for cln in cols]
         rtop = [np.mean([c.get("R_top", c["top"]) for c in row]) for row in rows]
@@ -580,6 +702,20 @@ class TableStructureRecognizer(Recognizer):
         return tbl
 
     def _run_ascend_tsr(self, image_list, thr=0.2, batch_size=16):
+        """
+        使用华为昇腾（Ascend）NPU 执行表格结构识别。
+
+        加载 .om 格式模型，使用昇腾推理引擎进行推理。
+        预处理和后处理与 ONNX 版本共享（继承自 Recognizer 基类）。
+
+        Args:
+            image_list: 图像列表
+            thr: 置信度阈值
+            batch_size: 批处理大小
+
+        Returns:
+            list: 每张图像的表格检测结果
+        """
         import math
 
         from ais_bench.infer.interface import InferSession

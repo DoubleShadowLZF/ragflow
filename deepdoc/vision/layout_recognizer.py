@@ -14,6 +14,22 @@
 #  limitations under the License.
 #
 
+"""
+版面布局识别模块
+
+提供文档图像的版面布局分析功能，识别以下区域类型：
+- 文本（Text）、标题（Title）
+- 图片（Figure）、图片说明（Figure caption）
+- 表格（Table）、表格说明（Table caption）
+- 页眉（Header）、页脚（Footer）
+- 参考文献（Reference）、公式（Equation）
+
+支持三种识别器实现：
+- LayoutRecognizer: 基类，使用 ONNX 模型 + 传统后处理
+- LayoutRecognizer4YOLOv10: 基于 YOLOv10 的版面识别
+- AscendLayoutRecognizer: 华为昇腾平台的版面识别
+"""
+
 import logging
 import math
 import os
@@ -31,6 +47,18 @@ from deepdoc.vision.operators import nms
 
 
 class LayoutRecognizer(Recognizer):
+    """
+    版面布局识别器。
+
+    基于 ONNX 目标检测模型，识别文档中的版面元素（标题、文本、表格、图片等）。
+    将模型检测结果与 OCR 文字块对齐，为每个文字块打上布局类型标签。
+
+    支持通过 DEEPDOC_URL / TENSORRT_DLA_SVR 环境变量使用远程 DLA 推理服务。
+
+    Attributes:
+        labels: 版面类别标签列表
+        garbage_layouts: 垃圾布局类型（页眉、页脚、参考文献），可选择丢弃
+    """
     labels = [
         "_background_",
         "Text",
@@ -66,6 +94,29 @@ class LayoutRecognizer(Recognizer):
             super().__init__(self.labels, domain, model_dir)
 
     def __call__(self, image_list, ocr_res, scale_factor=3, thr=0.2, batch_size=16, drop=True):
+        """
+        执行版面布局识别并与 OCR 结果融合。
+
+        处理流程：
+        1. 运行布局检测模型，获取版面区域
+        2. 缩放区域坐标到原始图像尺寸（除以 scale_factor）
+        3. 按 Y 坐标排序后清理重叠区域
+        4. 将 OCR 文字块与检测到的版面区域进行匹配
+        5. 为每个文字块打上 layout_type 标签
+        6. 过滤页眉/页脚/参考文献中的重复垃圾文字
+
+        Args:
+            image_list: 原始图像列表（PIL Image）
+            scale_factor: 缩放因子（PDF 渲染时的放大倍数）
+            thr: 检测置信度阈值
+            batch_size: 批处理大小
+            drop: 是否丢弃页眉/页脚/参考文献区域的文字
+
+        Returns:
+            tuple: (ocr_res, page_layout)
+                - ocr_res: 打上布局标签后的文字块列表
+                - page_layout: 每页的布局区域信息
+        """
         def __is_garbage(b):
             patt = [r"\(cid\s*:\s*\d+\s*\)"]
             return any([re.search(p, b.get("text", "")) for p in patt])
@@ -166,6 +217,20 @@ class LayoutRecognizer(Recognizer):
 
 
 class LayoutRecognizer4YOLOv10(LayoutRecognizer):
+    """
+    基于 YOLOv10 的版面布局识别器。
+
+    相比基类 LayoutRecognizer，使用 YOLOv10 模型架构，具有更高的检测精度和速度。
+    预处理采用 letterbox 缩放策略（保持宽高比 + 填充），后处理按类别分别进行 NMS。
+
+    Attributes:
+        labels: YOLOv10 特定的类别标签映射
+        auto: 是否使用自动锚框（默认 False）
+        scaleFill: 是否使用缩放填充模式
+        scaleup: 是否允许放大
+        stride: 模型 stride（默认 32）
+    """
+
     labels = [
         "title",
         "Text",
@@ -243,6 +308,21 @@ class LayoutRecognizer4YOLOv10(LayoutRecognizer):
 
 
 class AscendLayoutRecognizer(Recognizer):
+    """
+    华为昇腾（Ascend）平台的版面布局识别器。
+
+    使用昇腾推理引擎（ais_bench）加载 .om 格式模型进行推理。
+    预处理和后处理逻辑与 LayoutRecognizer4YOLOv10 类似，
+    但推理后端使用昇腾 NPU 而非 ONNX Runtime。
+
+    通过环境变量 ASCEND_LAYOUT_RECOGNIZER_DEVICE_ID 指定昇腾设备 ID。
+
+    Attributes:
+        session: 昇腾推理会话
+        input_shape: 模型输入尺寸 (H, W)
+        garbage_layouts: 垃圾布局类型列表
+    """
+
     labels = [
         "title",
         "Text",

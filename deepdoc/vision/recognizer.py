@@ -13,6 +13,18 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+识别器基类模块
+
+提供所有视觉识别任务的基类 Recognizer，包括：
+- ONNX 模型加载与推理
+- 图像预处理和后处理
+- 版面分析中的布局排序与重叠检测
+- 布局清理与去重
+
+子类包括 LayoutRecognizer（版面识别）和 TableStructureRecognizer（表格结构识别）。
+"""
+
 import gc
 import logging
 import os
@@ -29,17 +41,42 @@ from . import operators
 from .ocr import load_model
 
 class Recognizer:
+    """
+    视觉识别器基类。
+
+    提供 ONNX 模型推理的通用流程：
+    1. preprocess: 图像预处理（缩放、归一化、通道转换）
+    2. ort_sess.run: ONNX 模型推理
+    3. postprocess: 后处理（NMS、阈值过滤、坐标映射）
+
+    同时提供版面分析中常用的工具方法：
+    - 重叠面积计算
+    - 布局排序（按 Y/X/C/R 坐标）
+    - 布局去重与清理
+    - 文本框与布局区域的对齐匹配
+
+    Attributes:
+        label_list: 类别标签列表
+        ort_sess: ONNX Runtime 推理会话
+        run_options: ONNX Runtime 运行选项
+        input_names: 模型输入节点名称列表
+        output_names: 模型输出节点名称列表
+        input_shape: 模型输入尺寸 (H, W)
+    """
     def __init__(self, label_list, task_name, model_dir=None):
         """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
+        初始化识别器。
 
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
+        加载 ONNX 模型并获取输入/输出节点信息。
 
-        For Windows:
-        Good luck
-        ^_-
+        HuggingFace 模型下载说明：
+        - Linux: export HF_ENDPOINT=https://hf-mirror.com
+        - Windows: 祝你好运 ^_-
 
+        Args:
+            label_list: 类别标签列表，如 ["text", "title", "table", ...]
+            task_name: 任务名称，对应模型文件名（不含 .onnx 后缀）
+            model_dir: 模型文件目录，默认使用项目内置目录
         """
         if not model_dir:
             model_dir = os.path.join(
@@ -53,6 +90,19 @@ class Recognizer:
 
     @staticmethod
     def sort_Y_firstly(arr, threshold):
+        """
+        按 Y 坐标优先排序布局元素。
+
+        先按 top（Y 坐标）排序，若两个元素的 Y 坐标差小于 threshold，
+        则按 x0（X 坐标）排序。用于确定文档中文本的阅读顺序。
+
+        Args:
+            arr: 布局元素列表，每个元素需包含 'top' 和 'x0' 键
+            threshold: Y 坐标差阈值，小于此值视为同一行
+
+        Returns:
+            排序后的列表
+        """
         def cmp(c1, c2):
             diff = c1["top"] - c2["top"]
             if abs(diff) < threshold:
@@ -63,6 +113,19 @@ class Recognizer:
 
     @staticmethod
     def sort_X_firstly(arr, threshold):
+        """
+        按 X 坐标优先排序布局元素。
+
+        先按 x0（X 坐标）排序，若两个元素的 X 坐标差小于 threshold，
+        则按 top（Y 坐标）排序。适用于表格列排序等场景。
+
+        Args:
+            arr: 布局元素列表，每个元素需包含 'x0' 和 'top' 键
+            threshold: X 坐标差阈值
+
+        Returns:
+            排序后的列表
+        """
         def cmp(c1, c2):
             diff = c1["x0"] - c2["x0"]
             if abs(diff) < threshold:
@@ -73,8 +136,20 @@ class Recognizer:
 
     @staticmethod
     def sort_C_firstly(arr, thr=0):
-        # sort using y1 first and then x1
-        # sorted(arr, key=lambda r: (r["x0"], r["top"]))
+        """
+        按列（Column）优先排序。
+
+        先用 sort_X_firstly 按 X 排序，然后根据每个元素的 "C"（列号）
+        属性和 top 坐标进行微调，确保同列元素被正确排列。
+
+        Args:
+            arr: 布局元素列表，需包含 "C" 键（列索引）
+            thr: 排序阈值
+
+        Returns:
+            排序后的列表
+        """
+        # 先用 X 坐标排序，再微调列顺序
         arr = Recognizer.sort_X_firstly(arr, thr)
         for i in range(len(arr) - 1):
             for j in range(i, -1, -1):
@@ -93,8 +168,20 @@ class Recognizer:
 
     @staticmethod
     def sort_R_firstly(arr, thr=0):
-        # sort using y1 first and then x1
-        # sorted(arr, key=lambda r: (r["top"], r["x0"]))
+        """
+        按行（Row）优先排序。
+
+        先用 sort_Y_firstly 按 Y 排序，然后根据每个元素的 "R"（行号）
+        属性和 x0 坐标进行微调，确保同行元素被正确排列。
+
+        Args:
+            arr: 布局元素列表，需包含 "R" 键（行索引）
+            thr: 排序阈值
+
+        Returns:
+            排序后的列表
+        """
+        # 先用 Y 坐标排序，再微调行顺序
         arr = Recognizer.sort_Y_firstly(arr, thr)
         for i in range(len(arr) - 1):
             for j in range(i, -1, -1):
@@ -112,6 +199,17 @@ class Recognizer:
 
     @staticmethod
     def overlapped_area(a, b, ratio=True):
+        """
+        计算两个矩形框的重叠面积。
+
+        Args:
+            a: 矩形框 A，包含 top, bottom, x0, x1
+            b: 矩形框 B，包含 top, bottom, x0, x1
+            ratio: 若为 True，返回重叠面积占 A 面积的比例；否则返回绝对面积
+
+        Returns:
+            float: 重叠面积或重叠比例
+        """
         tp, btm, x0, x1 = a["top"], a["bottom"], a["x0"], a["x1"]
         if b["x0"] > x1 or b["x1"] < x0:
             return 0
@@ -133,6 +231,22 @@ class Recognizer:
 
     @staticmethod
     def layouts_cleanup(boxes, layouts, far=2, thr=0.7):
+        """
+        清理重复或高度重叠的布局区域。
+
+        对于相邻且高度重叠的同类型布局区域，根据以下规则去重：
+        1. 比较置信度分数，保留分数高的
+        2. 比较区域内包含的文字面积，保留文字面积大的
+
+        Args:
+            boxes: OCR 文字块列表
+            layouts: 布局区域列表
+            far: 检查的邻居范围（相邻多少个布局）
+            thr: 重叠比例阈值
+
+        Returns:
+            去重后的布局区域列表
+        """
         def not_overlapped(a, b):
             return any([a["x1"] < b["x0"],
                         a["x0"] > b["x1"],
@@ -176,12 +290,17 @@ class Recognizer:
         return layouts
 
     def create_inputs(self, imgs, im_info):
-        """generate input for different model type
+        """
+        为模型生成批量输入数据。
+
+        将多张不同尺寸的图像填充到统一尺寸，构建 batch 输入。
+
         Args:
-            imgs (list(numpy)): list of images (np.ndarray)
-            im_info (list(dict)): list of image info
+            imgs (list): numpy 图像列表
+            im_info (list): 每张图像的信息列表
+
         Returns:
-            inputs (dict): input of model
+            dict: 模型输入字典，包含 'image', 'im_shape', 'scale_factor'
         """
         inputs = {}
 
@@ -216,6 +335,19 @@ class Recognizer:
 
     @staticmethod
     def find_overlapped(box, boxes_sorted_by_y, naive=False):
+        """
+        在按 Y 坐标排序的框列表中，通过二分查找定位与给定框重叠最大的框。
+
+        使用二分查找优化搜索范围，只在 Y 坐标可能重叠的区间内遍历。
+
+        Args:
+            box: 目标框，包含 top, bottom
+            boxes_sorted_by_y: 按 Y 排序的框列表
+            naive: 是否使用朴素遍历（不优化）
+
+        Returns:
+            int 或 None: 重叠面积最大的框索引
+        """
         if not boxes_sorted_by_y:
             return
         bxs = boxes_sorted_by_y
@@ -251,6 +383,19 @@ class Recognizer:
 
     @staticmethod
     def find_horizontally_tightest_fit(box, boxes):
+        """
+        找到水平方向上最紧密对齐的框。
+
+        在同一列（相同 layoutno）的框中，找到 X 坐标距离最小的框。
+        用于将 OCR 文字块与表格列对齐。
+
+        Args:
+            box: 目标框
+            boxes: 候选框列表
+
+        Returns:
+            int 或 None: 最紧密匹配的框索引
+        """
         if not boxes:
             return
         min_dis, min_i = 1000000, None
@@ -265,6 +410,20 @@ class Recognizer:
 
     @staticmethod
     def find_overlapped_with_threshold(box, boxes, thr=0.3):
+        """
+        在框列表中查找与给定框重叠面积超过阈值的框。
+
+        同时考虑双向重叠比例（box 覆盖候选框 和 候选框覆盖 box），
+        取两者都超过阈值且综合重叠最大的框。
+
+        Args:
+            box: 目标框
+            boxes: 候选框列表
+            thr: 重叠比例阈值，默认 0.3
+
+        Returns:
+            int 或 None: 匹配的框索引
+        """
         if not boxes:
             return
         max_overlapped_i, max_overlapped, _max_overlapped = None, thr, 0
@@ -281,6 +440,20 @@ class Recognizer:
         return max_overlapped_i
 
     def preprocess(self, image_list):
+        """
+        图像预处理。
+
+        根据模型输入格式的不同，支持两种预处理路径：
+        1. 若模型需要 scale_factor（如 PaddleDetection 导出模型）：
+           使用 LinearResize → StandardizeImage → Permute → PadStride 流程
+        2. 否则：直接缩放到模型输入尺寸，归一化到 [0, 1]，转换为 CHW 格式
+
+        Args:
+            image_list: PIL Image 或 numpy 图像列表
+
+        Returns:
+            list: 每张图像的模型输入字典
+        """
         inputs = []
         if "scale_factor" in self.input_names:
             preprocess_ops = []
@@ -312,6 +485,27 @@ class Recognizer:
         return inputs
 
     def postprocess(self, boxes, inputs, thr):
+        """
+        模型输出后处理。
+
+        将模型原始输出转换为标准检测结果格式。
+        支持两种输出格式：
+        1. PaddleDetection 风格：[class_id, score, x1, y1, x2, y2]
+        2. YOLO 风格：[x, y, w, h, obj_conf, class_probs...]
+
+        执行步骤：
+        - 阈值过滤低分框
+        - 坐标映射回原始图像尺寸（乘以 scale_factor）
+        - 类别级别的 NMS 去重
+
+        Args:
+            boxes: 模型原始输出
+            inputs: 预处理时记录的输入信息（含 scale_factor）
+            thr: 置信度阈值
+
+        Returns:
+            list: [{"type": 类别名, "bbox": [x1,y1,x2,y2], "score": 分数}, ...]
+        """
         if "scale_factor" in self.input_names:
             bb = []
             for b in boxes:
@@ -413,6 +607,20 @@ class Recognizer:
         gc.collect()
 
     def __call__(self, image_list, thr=0.7, batch_size=16):
+        """
+        执行识别推理。
+
+        按 batch 处理图像列表，依次执行：
+        preprocess → ONNX 推理 → postprocess
+
+        Args:
+            image_list: PIL Image 或 numpy 图像列表
+            thr: 置信度阈值，低于此值的检测框将被过滤
+            batch_size: 批量大小
+
+        Returns:
+            list: 每张图像的检测结果列表
+        """
         res = []
         images = []
         for i in range(len(image_list)):

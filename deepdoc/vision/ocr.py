@@ -13,6 +13,19 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+OCR（光学字符识别）模块
+
+提供完整的 OCR 流程，包括：
+- TextDetector: 文本检测（定位图像中的文字区域）
+- TextRecognizer: 文本识别（将裁剪的文字区域转换为字符串）
+- OCR: 统一的 OCR 接口，组合检测 + 识别，支持多 GPU 并行
+
+模型格式：ONNX Runtime
+字符集：通过 ocr.res 文件定义
+支持 CUDA GPU 加速和 CPU 推理
+"""
+
 import gc
 import logging
 import copy
@@ -33,6 +46,7 @@ import onnxruntime as ort
 
 from .postprocess import build_post_process
 
+# 全局模型缓存，避免重复加载
 loaded_models = {}
 
 def transform(data, ops=None):
@@ -137,6 +151,26 @@ def load_model(model_dir, nm, device_id: int | None = None):
 
 
 class TextRecognizer:
+    """
+    文本识别器（CRNN + CTC）。
+
+    将裁剪后的文字图像区域识别为文本字符串。
+    使用 ONNX 导出的 CRNN 模型 + CTC 解码器。
+
+    图像预处理步骤：
+    1. 缩放：保持宽高比，将高度缩放到固定值（48px）
+    2. 填充：将宽度填充到固定值（320px）
+    3. 归一化：(img - 0.5) / 0.5 缩放到 [-1, 1]
+    4. 转换为 CHW 格式
+
+    Attributes:
+        rec_image_shape: 输入图像形状 [C, H, W]，默认 [3, 48, 320]
+        rec_batch_num: 批处理大小，默认 16
+        postprocess_op: CTC 解码器
+        predictor: ONNX 推理会话
+        input_tensor: 模型输入张量描述
+    """
+
     def __init__(self, model_dir, device_id: int | None = None):
         self.rec_image_shape = [int(v) for v in "3, 48, 320".split(",")]
         self.rec_batch_num = 16
@@ -367,6 +401,23 @@ class TextRecognizer:
         gc.collect()
 
     def __call__(self, img_list):
+        """
+        对裁剪的文字图像列表执行文本识别。
+
+        识别流程：
+        1. 按宽高比排序（加速批处理）
+        2. 将图像缩放到统一高度并填充到固定宽度
+        3. 批量送入 ONNX 模型推理
+        4. CTC 解码为文本字符串
+
+        Args:
+            img_list: 裁剪的文字图像列表（numpy 数组）
+
+        Returns:
+            tuple: (rec_res, elapse)
+                - rec_res: [(text, confidence), ...] 识别结果
+                - elapse: 推理耗时（秒）
+        """
         img_num = len(img_list)
         # Calculate the aspect ratio of all text bars
         width_list = []
@@ -418,6 +469,26 @@ class TextRecognizer:
 
 
 class TextDetector:
+    """
+    文本检测器（DB: Differentiable Binarization）。
+
+    在图像中定位文字区域，返回四边形文本框坐标。
+
+    预处理流程：
+    1. DetResizeForTest: 限制最长边到 960px，对齐到 32 的倍数
+    2. NormalizeImage: ImageNet 标准化
+    3. ToCHWImage: 转换为 CHW 格式
+
+    后处理流程：
+    DBPostProcess: 二值化掩码 → 轮廓检测 → 文本框扩张 → 过滤
+
+    Attributes:
+        preprocess_op: 预处理算子列表
+        postprocess_op: DBPostProcess 后处理实例
+        predictor: ONNX 推理会话
+        input_tensor: 模型输入张量描述
+    """
+
     def __init__(self, model_dir, device_id: int | None = None):
         pre_process_list = [{
             'DetResizeForTest': {
@@ -457,6 +528,17 @@ class TextDetector:
         self.preprocess_op = create_operators(pre_process_list)
 
     def order_points_clockwise(self, pts):
+        """
+        将四边形顶点按顺时针排序。
+
+        排序规则：左上 → 右上 → 右下 → 左下
+
+        Args:
+            pts: 四边形的四个顶点坐标
+
+        Returns:
+            numpy array: 顺时针排序后的顶点
+        """
         rect = np.zeros((4, 2), dtype="float32")
         s = pts.sum(axis=1)
         rect[0] = pts[np.argmin(s)]
@@ -474,6 +556,20 @@ class TextDetector:
         return points
 
     def filter_tag_det_res(self, dt_boxes, image_shape):
+        """
+        过滤检测结果中的无效框。
+
+        过滤规则：
+        - 框的宽或高小于 3 像素的丢弃
+        - 超出图像边界的坐标被裁剪
+
+        Args:
+            dt_boxes: 检测框列表
+            image_shape: 图像尺寸 (H, W)
+
+        Returns:
+            numpy array: 过滤后的有效框
+        """
         img_height, img_width = image_shape[0:2]
         dt_boxes_new = []
         for box in dt_boxes:
@@ -507,6 +603,17 @@ class TextDetector:
         gc.collect()
 
     def __call__(self, img):
+        """
+        执行文本检测。
+
+        Args:
+            img: 输入图像（numpy 数组，BGR 格式）
+
+        Returns:
+            tuple: (dt_boxes, elapse)
+                - dt_boxes: 检测到的文本框列表或 None
+                - elapse: 推理耗时（秒）
+        """
         ori_im = img.copy()
         data = {'image': img}
 
@@ -540,17 +647,36 @@ class TextDetector:
 
 
 class OCR:
+    """
+    光学字符识别（OCR）引擎。
+
+    将文本检测（TextDetector）和文本识别（TextRecognizer）串联，
+    提供完整的 OCR 流程：图像 → 文本框坐标 + 文字内容。
+
+    支持多 GPU 并行加速：
+    - 当 PARALLEL_DEVICES > 1 时，为每个 GPU 创建独立的检测器和识别器
+    - 通过 device_id 参数选择使用哪个 GPU 设备
+
+    Attributes:
+        text_detector: TextDetector 列表（每个 GPU 一个）
+        text_recognizer: TextRecognizer 列表（每个 GPU 一个）
+        drop_score: 识别结果置信度阈值，默认 0.5
+        crop_image_res_index: 裁剪图像分辨率索引
+    """
+
     def __init__(self, model_dir=None):
         """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
+        初始化 OCR 引擎。
 
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
+        自动下载并加载 ONNX 格式的检测和识别模型。
+        支持多 GPU 环境下的并行加载。
 
-        For Windows:
-        Good luck
-        ^_-
+        HuggingFace 模型下载说明：
+        - Linux: export HF_ENDPOINT=https://hf-mirror.com
+        - Windows: 祝你好运 ^_-
 
+        Args:
+            model_dir: 模型文件目录，默认使用项目内置目录
         """
         if not model_dir:
             try:
@@ -589,15 +715,27 @@ class OCR:
 
     def get_rotate_crop_image(self, img, points):
         """
-        img_height, img_width = img.shape[0:2]
-        left = int(np.min(points[:, 0]))
-        right = int(np.max(points[:, 0]))
-        top = int(np.min(points[:, 1]))
-        bottom = int(np.max(points[:, 1]))
-        img_crop = img[top:bottom, left:right, :].copy()
-        points[:, 0] = points[:, 0] - left
-        points[:, 1] = points[:, 1] - top
+        根据四边形框从原图中透视变换裁剪出文字区域。
+
+        对于高宽比 >= 1.5 的裁剪结果，会尝试 0°/90°/270° 三个方向，
+        选择识别分数最高的方向，以处理竖排文字等场景。
+
+        Args:
+            img: 原始图像
+            points: 四个顶点坐标（四边形）
+
+        Returns:
+            numpy array: 校正后的文字区域图像
         """
+        # 注释掉的备用裁剪方案（简单矩形裁剪）：
+        # img_height, img_width = img.shape[0:2]
+        # left = int(np.min(points[:, 0]))
+        # right = int(np.max(points[:, 0]))
+        # top = int(np.min(points[:, 1]))
+        # bottom = int(np.max(points[:, 1]))
+        # img_crop = img[top:bottom, left:right, :].copy()
+        # points[:, 0] = points[:, 0] - left
+        # points[:, 1] = points[:, 1] - top
         assert len(points) == 4, "shape of points must be 4*2"
         img_crop_width = int(
             max(
@@ -645,11 +783,17 @@ class OCR:
 
     def sorted_boxes(self, dt_boxes):
         """
-        Sort text boxes in order from top to bottom, left to right
-        args:
-            dt_boxes(array):detected text boxes with shape [4, 2]
-        return:
-            sorted boxes(array) with shape [4, 2]
+        将文本框按从上到下、从左到右的顺序排序。
+
+        排序策略：
+        1. 先按 top（Y 坐标）排序
+        2. 同一行内（Y 差 < 10px）按 x0（X 坐标）排序
+
+        Args:
+            dt_boxes: 检测到的文本框，shape [N, 4, 2]
+
+        Returns:
+            list: 排序后的文本框列表
         """
         num_boxes = dt_boxes.shape[0]
         sorted_boxes = sorted(dt_boxes, key=lambda x: (x[0][1], x[0][0]))
@@ -667,6 +811,16 @@ class OCR:
         return _boxes
 
     def detect(self, img, device_id: int | None = None):
+        """
+        仅执行文本检测（不识别文字内容）。
+
+        Args:
+            img: 输入图像
+            device_id: GPU 设备 ID，None 表示使用设备 0
+
+        Returns:
+            zip 或 None: (文本框坐标, ("", 0)) 的迭代器
+        """
         if device_id is None:
             device_id = 0
 
@@ -682,6 +836,17 @@ class OCR:
                    ("", 0) for _ in range(len(dt_boxes))])
 
     def recognize(self, ori_im, box, device_id: int | None = None):
+        """
+        对单个文本框区域执行文字识别。
+
+        Args:
+            ori_im: 原始图像
+            box: 文本框四点坐标
+            device_id: GPU 设备 ID
+
+        Returns:
+            str: 识别出的文字内容（置信度低于 drop_score 时返回空字符串）
+        """
         if device_id is None:
             device_id = 0
 
@@ -694,6 +859,16 @@ class OCR:
         return text
 
     def recognize_batch(self, img_list, device_id: int | None = None):
+        """
+        批量文字识别。
+
+        Args:
+            img_list: 裁剪后的文字图像列表
+            device_id: GPU 设备 ID
+
+        Returns:
+            list: 识别出的文字内容列表
+        """
         if device_id is None:
             device_id = 0
         rec_res, elapse = self.text_recognizer[device_id](img_list)
@@ -706,6 +881,26 @@ class OCR:
         return texts
 
     def __call__(self, img, device_id = 0, cls=True):
+        """
+        执行完整的 OCR 流程：文本检测 + 文字识别。
+
+        流程：
+        1. TextDetector: 在图像中检测文字区域
+        2. 排序文本框（从上到下、从左到右）
+        3. 透视变换裁剪每个文字区域
+        4. TextRecognizer: 识别每个裁剪区域的文字内容
+        5. 过滤低置信度结果
+
+        Args:
+            img: 输入图像（numpy 数组，BGR 格式）
+            device_id: GPU 设备 ID，默认 0
+            cls: 是否执行文字方向分类（保留参数，当前未使用）
+
+        Returns:
+            tuple: (result, None, time_dict) 或 (None, None, time_dict)
+                - result: [(box_points, (text, score)), ...]
+                - time_dict: {'det': ..., 'rec': ..., 'cls': ..., 'all': ...}
+        """
         time_dict = {'det': 0, 'rec': 0, 'cls': 0, 'all': 0}
         if device_id is None:
             device_id = 0

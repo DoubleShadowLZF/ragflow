@@ -14,6 +14,20 @@
 #  limitations under the License.
 #
 
+"""
+图像预处理算子模块
+
+提供 OCR 检测和识别流程中的图像预处理操作，包括：
+- 图像解码与色彩空间转换
+- 图像归一化（减均值、除标准差）
+- 尺寸调整（保持比例/固定尺寸/限制边长）
+- 通道格式转换（HWC ↔ CHW）
+- 边缘填充（Pad/Stride 对齐）
+- NMS（非极大值抑制）
+
+所有这些算子作为可调用对象实现，通过 transform() 函数链式调用。
+"""
+
 import logging
 import sys
 import ast
@@ -26,7 +40,19 @@ from rag.utils.lazy_image import ensure_pil_image
 
 
 class DecodeImage:
-    """ decode image """
+    """
+    图像解码算子。
+
+    将原始字节流解码为 numpy 数组格式的图像，支持：
+    - RGB / GRAY 色彩模式转换
+    - HWC ↔ CHW 通道顺序切换
+    - 忽略 EXIF 旋转信息
+
+    Attributes:
+        img_mode: 目标色彩模式（'RGB' 或 'GRAY'）
+        channel_first: 是否将通道维放在第一维（CHW 格式）
+        ignore_orientation: 是否忽略 EXIF 旋转信息
+    """
 
     def __init__(self,
                  img_mode='RGB',
@@ -38,6 +64,7 @@ class DecodeImage:
         self.ignore_orientation = ignore_orientation
 
     def __call__(self, data):
+        """执行图像解码"""
         img = data['image']
         if six.PY2:
             assert isinstance(img, str) and len(
@@ -105,7 +132,17 @@ class StandardizeImag:
 
 
 class NormalizeImage:
-    """ normalize image such as subtract mean, divide std
+    """
+    图像归一化算子。
+
+    对图像执行标准化操作：img = (img * scale - mean) / std
+    使用 ImageNet 默认均值和标准差。
+
+    Args:
+        scale: 缩放因子（默认为 1/255）
+        mean: 均值，默认 [0.485, 0.456, 0.406]（ImageNet）
+        std: 标准差，默认 [0.229, 0.224, 0.225]（ImageNet）
+        order: 通道顺序 'chw' 或 'hwc'
     """
 
     def __init__(self, scale=None, mean=None, std=None, order='chw', **kwargs):
@@ -140,7 +177,11 @@ class NormalizeImage:
 
 
 class ToCHWImage:
-    """ convert hwc image to chw image
+    """
+    通道顺序转换算子。
+
+    将图像从 HWC 格式转换为 CHW 格式（通道维前置），
+    这是大多数深度学习模型期望的输入格式。
     """
 
     def __init__(self, **kwargs):
@@ -157,6 +198,15 @@ class ToCHWImage:
 
 
 class KeepKeys:
+    """
+    键过滤算子。
+
+    从数据字典中只保留指定的键，过滤掉不需要的中间数据。
+    通常作为预处理管道的最后一步，只保留模型需要的输入。
+
+    Args:
+        keep_keys: 需要保留的键名列表
+    """
     def __init__(self, keep_keys, **kwargs):
         self.keep_keys = keep_keys
 
@@ -168,6 +218,16 @@ class KeepKeys:
 
 
 class Pad:
+    """
+    图像填充算子。
+
+    将图像填充到指定大小或使其尺寸能被 size_div 整除。
+    通常用于确保特征图尺寸与网络 stride 对齐。
+
+    Args:
+        size: 目标尺寸 [H, W]，若为 None 则只对齐到 size_div 的倍数
+        size_div: 尺寸对齐因子（默认 32）
+    """
     def __init__(self, size=None, size_div=32, **kwargs):
         if size is not None and not isinstance(size, (int, list, tuple)):
             raise TypeError("Type of target_size is invalid. Now is {}".format(
@@ -206,11 +266,16 @@ class Pad:
 
 
 class LinearResize:
-    """resize image by target_size and max_size
+    """
+    线性缩放算子。
+
+    按目标尺寸缩放图像，可选保持宽高比。如果开启 keep_ratio，
+    则按较短边缩放到目标尺寸，较长边按比例计算但不超过目标最大边。
+
     Args:
-        target_size (int): the target size of image
-        keep_ratio (bool): whether keep_ratio or not, default true
-        interp (int): method of resize
+        target_size: 目标尺寸 [H, W] 或单个整数
+        keep_ratio: 是否保持宽高比
+        interp: OpenCV 插值方法，默认 cv2.INTER_LINEAR
     """
 
     def __init__(self, target_size, keep_ratio=True, interp=cv2.INTER_LINEAR):
@@ -273,6 +338,14 @@ class LinearResize:
 
 
 class Resize:
+    """
+    直接缩放算子。
+
+    将图像和对应的多边形标注按比例缩放到指定尺寸。
+
+    Args:
+        size: 目标尺寸 (H, W)，默认 (640, 640)
+    """
     def __init__(self, size=(640, 640), **kwargs):
         self.size = size
 
@@ -303,6 +376,17 @@ class Resize:
 
 
 class DetResizeForTest:
+    """
+    文本检测推理时的图像缩放算子。
+
+    支持三种缩放模式：
+    - type 0 (limit_side_len): 限制最长/最短边到指定长度，并对齐到 32 的倍数
+    - type 1 (image_shape): 缩放到固定尺寸
+    - type 2 (resize_long): 限制长边到指定长度
+
+    对小图（宽高和 < 64）会自动填充到 32×32 以上。
+    """
+
     def __init__(self, **kwargs):
         super(DetResizeForTest, self).__init__()
         self.resize_type = 0
@@ -433,6 +517,13 @@ class DetResizeForTest:
 
 
 class E2EResizeForTest:
+    """
+    端到端推理时的图像缩放算子。
+
+    将图像长边限制到 max_side_len，并对齐到 128 的倍数。
+    针对 totaltext 数据集有特殊的缩放比例（1.25 倍）。
+    """
+
     def __init__(self, **kwargs):
         super(E2EResizeForTest, self).__init__()
         self.max_side_len = kwargs['max_side_len']
@@ -501,6 +592,13 @@ class E2EResizeForTest:
 
 
 class KieResize:
+    """
+    KIE（关键信息提取）推理时的图像缩放算子。
+
+    将图像缩放到 1024×1024 画布内，对齐到 32 的倍数，
+    同时同步缩放对应的标注点坐标。
+    """
+
     def __init__(self, **kwargs):
         super(KieResize, self).__init__()
         self.max_side, self.min_side = kwargs['img_scale'][0], kwargs[
@@ -601,9 +699,13 @@ class ResizeNormalize:
 
 class GrayImageChannelFormat:
     """
-    format gray scale image's channel: (3,h,w) -> (1,h,w)
+    灰度图像通道格式化算子。
+
+    将三通道彩色图像转换为单通道灰度图像。
+    格式转换：(3, H, W) → (1, H, W)
+
     Args:
-        inverse: inverse gray image
+        inverse: 是否反转灰度值（生成负片效果）
     """
 
     def __init__(self, inverse=False, **kwargs):
@@ -624,32 +726,34 @@ class GrayImageChannelFormat:
 
 
 class Permute:
-    """permute image
+    """
+    通道置换算子。
+
+    将图像从 HWC 格式转换为 CHW 格式（通道维前置）。
+    这是大多数深度学习模型的标准输入格式。
+
     Args:
-        to_bgr (bool): whether convert RGB to BGR
-        channel_first (bool): whether convert HWC to CHW
+        to_bgr (bool): 是否将 RGB 转换为 BGR（未使用）
+        channel_first (bool): 是否将 HWC 转为 CHW
     """
 
     def __init__(self, ):
         super(Permute, self).__init__()
 
     def __call__(self, im, im_info):
-        """
-        Args:
-            im (np.ndarray): image (np.ndarray)
-            im_info (dict): info of image
-        Returns:
-            im (np.ndarray):  processed image (np.ndarray)
-            im_info (dict): info of processed image
-        """
+        """执行通道置换：HWC → CHW"""
         im = im.transpose((2, 0, 1)).copy()
         return im, im_info
 
 
 class PadStride:
-    """ padding image for model with FPN, instead PadBatch(pad_to_stride) in original config
+    """
+    Stride 对齐填充算子。
+
+    将图像尺寸填充到 stride 的整数倍，满足 FPN 等特征金字塔网络的要求。
+
     Args:
-        stride (bool): model with FPN need image shape % stride == 0
+        stride: 对齐步长，默认 0（不填充）
     """
 
     def __init__(self, stride=0):
@@ -676,13 +780,17 @@ class PadStride:
 
 
 def decode_image(im_file, im_info):
-    """read rgb image
+    """
+    读取 RGB 图像。
+
+    支持文件路径字符串和 numpy 数组两种输入格式。
+
     Args:
-        im_file (str|np.ndarray): input can be image path or np.ndarray
-        im_info (dict): info of image
+        im_file (str|np.ndarray): 图像文件路径或 numpy 数组
+        im_info (dict): 图像信息字典，会被写入 'im_shape' 和 'scale_factor'
+
     Returns:
-        im (np.ndarray):  processed image (np.ndarray)
-        im_info (dict): info of processed image
+        tuple: (im, im_info) - RGB 格式的 numpy 数组和更新后的信息字典
     """
     if isinstance(im_file, str):
         with open(im_file, 'rb') as f:
@@ -698,7 +806,18 @@ def decode_image(im_file, im_info):
 
 
 def preprocess(im, preprocess_ops):
-    # process image by preprocess_ops
+    """
+    通过预处理算子链处理图像。
+
+    按顺序应用预处理操作列表，将图像从原始格式转换为模型输入格式。
+
+    Args:
+        im: 输入图像（文件路径或 numpy 数组）
+        preprocess_ops: 预处理算子列表
+
+    Returns:
+        tuple: (im, im_info) - 处理后的图像和元信息
+    """
     im_info = {
         'scale_factor': np.array(
             [1., 1.], dtype=np.float32),
@@ -711,6 +830,20 @@ def preprocess(im, preprocess_ops):
 
 
 def nms(bboxes, scores, iou_thresh):
+    """
+    非极大值抑制（NMS）。
+
+    用于去除重叠的检测框，保留置信度最高的框。
+    通过贪心策略按分数从高到低排序，逐个移除 IoU 超过阈值的框。
+
+    Args:
+        bboxes: 边界框数组，shape (N, 4)，每行为 [x1, y1, x2, y2]
+        scores: 每个框的置信度分数
+        iou_thresh: IoU 阈值，超过此值的重叠框将被抑制
+
+    Returns:
+        list: 保留的框索引列表
+    """
     import numpy as np
     x1 = bboxes[:, 0]
     y1 = bboxes[:, 1]
