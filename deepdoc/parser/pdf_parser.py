@@ -1204,9 +1204,9 @@ class RAGFlowPdfParser:
 
                 # 连接特征（倾向于合并）
                 concatting_feats = [
-                    b["text"].strip()[-1] in ",;:'\"，、'";：-",
-                    len(b["text"].strip()) > 1 and b["text"].strip()[-2] in ",;:'\"，'";：",
-                    b_["text"].strip() and b_["text"].strip()[0] in "。；？！?？）),，、：",
+                    b["text"].strip()[-1] in ",;:'\"，、‘“；：-",
+                    len(b["text"].strip()) > 1 and b["text"].strip()[-2] in ",;:'\"，‘“、；：",
+                    b_["text"].strip() and b_["text"].strip()[0] in "。；？！?”）),，、：",
                 ]
                 # 分离特征（倾向于不合并）
                 feats = [
