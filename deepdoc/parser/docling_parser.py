@@ -13,6 +13,20 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+"""
+Docling PDF 解析器模块
+
+基于 IBM Docling 的 PDF 深度文档理解解析器。支持两种运行模式：
+1. 本地模式：直接调用 docling 库的 DocumentConverter 进行解析
+2. 远程模式：通过 HTTP API 调用 Docling Server 进行解析（支持分块端点优先）
+
+Docling 可以精确识别 PDF 中的文本、表格、图片和公式四种内容类型，
+并生成包含精确 bounding box 位置信息的结构化输出。
+
+本模块还提供基于位置标签的 PDF 区域截图（crop）能力，用于后续
+RAG 流程中的图文混排展示。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -40,7 +54,7 @@ except Exception:
 try:
     from deepdoc.parser.pdf_parser import RAGFlowPdfParser
 except Exception:
-    class RAGFlowPdfParser:  
+    class RAGFlowPdfParser:
         pass
 
 from deepdoc.parser.utils import extract_pdf_outlines
@@ -48,6 +62,13 @@ from deepdoc.parser.utils import extract_pdf_outlines
 
 
 class DoclingContentType(str, Enum):
+    """Docling 解析器可识别的四种内容类型枚举
+
+    IMAGE    — 图片
+    TABLE    — 表格
+    TEXT     — 普通文本
+    EQUATION — 数学公式
+    """
     IMAGE = "image"
     TABLE = "table"
     TEXT = "text"
@@ -56,7 +77,13 @@ class DoclingContentType(str, Enum):
 
 @dataclass
 class _BBox:
-    page_no: int  
+    """内部使用的 Bounding Box 坐标数据结构
+
+    page_no: PDF 页码（从1开始）
+    x0, y0: 左上角坐标
+    x1, y1: 右下角坐标
+    """
+    page_no: int
     x0: float
     y0: float
     x1: float
@@ -64,6 +91,18 @@ class _BBox:
 
 
 def _extract_bbox_from_prov(item, prov_attr: str = "prov") -> Optional[_BBox]:
+    """从 Docling 解析结果的 prov(provenance) 属性中提取 Bounding Box 信息
+
+    Docling 在解析结果中会附带来源信息(provenance)，包含页码和坐标。
+    本函数从该信息中统一提取为内部 _BBox 格式。
+
+    Args:
+        item: Docling 解析返回的元素对象
+        prov_attr: provenance 属性名，默认为 "prov"
+
+    Returns:
+        _BBox 对象，如果无法提取则返回 None
+    """
     prov = getattr(item, prov_attr, None)
     if not prov:
         return None
@@ -82,6 +121,19 @@ def _extract_bbox_from_prov(item, prov_attr: str = "prov") -> Optional[_BBox]:
 
 
 class DoclingParser(RAGFlowPdfParser):
+    """基于 IBM Docling 的 PDF 解析器
+
+    支持两种工作模式：
+    1. 本地解析（默认）：使用本地安装的 docling 库直接解析 PDF，
+       调用 DocumentConverter 进行文档结构识别
+    2. 远程解析：配置 docling_server_url 后，通过 HTTP API 调用
+       远程 Docling Server 进行解析，支持分块端点（chunking）优先策略
+
+    解析结果包括：
+    - sections: 文本段落列表，每项包含 (内容, 类型, 位置标签)
+    - tables: 表格数据列表，每项包含 (图片, HTML/内容) 和位置信息
+    """
+
     def __init__(self, docling_server_url: str = "", request_timeout: int = 600):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.page_images: list[Image.Image] = []
@@ -92,12 +144,24 @@ class DoclingParser(RAGFlowPdfParser):
         self.request_timeout = request_timeout
 
     def _effective_server_url(self, docling_server_url: Optional[str] = None) -> str:
+        """获取有效的 Docling Server URL
+
+        优先级：传入参数 > 实例属性 > 环境变量 DOCLING_SERVER_URL
+        """
         return (docling_server_url or self.docling_server_url or "").rstrip("/") or (
             os.environ.get("DOCLING_SERVER_URL", "").rstrip("/")
         )
 
     @staticmethod
     def _is_http_endpoint_valid(url: str, timeout: int = 5) -> bool:
+        """检测 HTTP 端点是否可达
+
+        先尝试 HEAD 请求，失败后降级为 GET 请求。
+        用于验证 Docling 服务器的 OpenAPI/docs/convert 等端点。
+
+        Returns:
+            True 表示端点可达（状态码为 200/301/302/307/308）
+        """
         try:
             response = requests.head(url, timeout=timeout, allow_redirects=True)
             return response.status_code in [200, 301, 302, 307, 308]
@@ -109,6 +173,15 @@ class DoclingParser(RAGFlowPdfParser):
                 return False
 
     def check_installation(self, docling_server_url: Optional[str] = None) -> bool:
+        """检查 Docling 解析器是否可用
+
+        检测顺序：
+        1. 优先检查远程服务器是否可达（通过 openapi/docs/convert 端点探测）
+        2. 本地检查 docling 库是否可导入并初始化 DocumentConverter
+
+        Returns:
+            True 表示至少一种方式可用
+        """
         server_url = self._effective_server_url(docling_server_url)
         if server_url:
             for path in ("/openapi.json", "/docs", "/v1/convert/source"):
@@ -128,6 +201,17 @@ class DoclingParser(RAGFlowPdfParser):
             return False
 
     def __images__(self, fnm, zoomin: int = 1, page_from=0, page_to=MAXIMUM_PAGE_NUMBER, callback=None):
+        """渲染 PDF 页面为图片列表
+
+        使用 pdfplumber 将指定页面范围的 PDF 渲染为 PIL Image 列表。
+        渲染后的图片存储在 self.page_images 中，供后续 crop() 方法使用。
+
+        Args:
+            fnm: PDF 文件路径或二进制内容
+            zoomin: 缩放倍数（1 表示 72 DPI，2 表示 144 DPI）
+            page_from: 起始页码（从0开始）
+            page_to: 结束页码（不包含）
+        """
         self.page_from = page_from
         self.page_to = page_to
         bytes_io = None

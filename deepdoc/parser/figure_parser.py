@@ -13,6 +13,26 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+
+"""
+视觉 LLM 图片解析增强模块
+
+利用多模态大模型（IMAGE2TEXT / Vision LLM）为文档中的图片生成语义描述。
+这是 DeepDoc 文档理解流程中的关键增强步骤——不仅仅提取图片原始像素，
+而是用大模型"看懂"图片内容，生成可检索的自然语言描述。
+
+核心组件：
+1. VisionFigureParser：主类，并发调用视觉模型处理图片列表
+2. 包装函数（wrappers）：针对不同文档来源的适配层
+   - vision_figure_parser_pdf_wrapper: PDF 解析的图片增强
+   - vision_figure_parser_docx_wrapper: Word 文档的图片增强
+   - vision_figure_parser_figure_xlsx_wrapper: Excel 的图片增强
+   - vision_figure_parser_docx_wrapper_naive: 纯文本块的图片描述增强
+
+上下文感知：支持提供图片的前后文本上下文（context_size），
+生成更具语境关联的描述。例如图表标题和前后段落会被整合到 prompt 中。
+"""
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
